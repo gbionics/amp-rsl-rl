@@ -80,7 +80,7 @@ class AMPOnPolicyRunner:
     a discriminator-based "style reward" from the expert dataset. This is combined
     with the environment reward as:
 
-        `reward = 0.5 * task_reward + 0.5 * style_reward`
+        `reward = (1-<style_weight>) * task_reward + <style_weight> * style_reward`
 
     This can be later generalized into a weighted or learned reward mixing policy.
 
@@ -135,6 +135,7 @@ class AMPOnPolicyRunner:
         self.dataset_cfg = train_cfg["dataset"]
         self.device = device
         self.env = env
+        self.style_weight = train_cfg.get("style_weight", 0.5)  # default to equal weighting if not specified
 
         observations = self.env.get_observations()
         default_sets = ["critic"]
@@ -379,7 +380,7 @@ class AMPOnPolicyRunner:
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    rewards = 0.5 * rewards + 0.5 * style_rewards
+                    rewards = (1 - self.style_weight) * rewards + self.style_weight * style_rewards
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)
