@@ -163,7 +163,7 @@ class AMPOnPolicyRunner:
             **self.critic_cfg,
         ).to(self.device)
 
-        amp_joint_names = self.cfg.get("amp_joint_names", None)
+        amp_joint_names = self.dataset_cfg.get("amp_joint_names", None)
         simulation_dt = self._resolve_simulation_dt()
 
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
