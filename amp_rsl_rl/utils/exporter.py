@@ -5,150 +5,52 @@
 #
 # Code taken from https://github.com/isaac-sim/IsaacLab/blob/5716d5600a1a0e45345bc01342a70bd81fac7889/source/isaaclab_rl/isaaclab_rl/rsl_rl/exporter.py
 
-import copy
 import os
 import torch
-from amp_rsl_rl.networks import ActorMoE
 
 
 def export_policy_as_onnx(
-    actor_critic: object,
+    policy_model: object,
     path: str,
     normalizer: object | None = None,
     filename="policy.onnx",
     verbose=False,
 ):
-    """Export policy into a Torch ONNX file.
+    """Export plain policy model into an ONNX file.
 
     Args:
-        actor_critic: The actor-critic torch module.
-        normalizer: The empirical normalizer module. If None, Identity is used.
+        policy_model: The policy torch module exposing ``as_onnx()``.
+        normalizer: Unused (kept for backward compatibility).
         path: The path to the saving directory.
         filename: The name of exported ONNX file. Defaults to "policy.onnx".
         verbose: Whether to print the model summary. Defaults to False.
     """
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-    policy_exporter = _OnnxPolicyExporter(actor_critic, normalizer, verbose)
-    policy_exporter.export(path, filename)
+    if not hasattr(policy_model, "as_onnx"):
+        raise TypeError(
+            "export_policy_as_onnx only supports plain policy models exposing as_onnx()."
+        )
 
+    onnx_model = policy_model.as_onnx(verbose=verbose).cpu()
+    dummy_inputs = (
+        onnx_model.get_dummy_inputs()
+        if hasattr(onnx_model, "get_dummy_inputs")
+        else (torch.zeros(1, onnx_model.input_size),)
+    )
+    if not isinstance(dummy_inputs, tuple):
+        dummy_inputs = (dummy_inputs,)
 
-"""
-Helper Classes - Private.
-"""
-
-
-class _TorchPolicyExporter(torch.nn.Module):
-    """Exporter of actor-critic into JIT file."""
-
-    def __init__(self, actor_critic, normalizer=None):
-        super().__init__()
-        self.actor = copy.deepcopy(actor_critic.actor)
-        self.is_recurrent = actor_critic.is_recurrent
-        if self.is_recurrent:
-            self.rnn = copy.deepcopy(actor_critic.memory_a.rnn)
-            self.rnn.cpu()
-            self.register_buffer(
-                "hidden_state",
-                torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size),
-            )
-            self.register_buffer(
-                "cell_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
-            )
-            self.forward = self.forward_lstm
-            self.reset = self.reset_memory
-        # copy normalizer if exists
-        if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
-        else:
-            self.normalizer = torch.nn.Identity()
-
-    def forward_lstm(self, x):
-        x = self.normalizer(x)
-        x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
-        self.hidden_state[:] = h
-        self.cell_state[:] = c
-        x = x.squeeze(0)
-        return self.actor(x)
-
-    def forward(self, x):
-        return self.actor(self.normalizer(x))
-
-    @torch.jit.export
-    def reset(self):
-        pass
-
-    def reset_memory(self):
-        self.hidden_state[:] = 0.0
-        self.cell_state[:] = 0.0
-
-    def export(self, path, filename):
-        os.makedirs(path, exist_ok=True)
-        path = os.path.join(path, filename)
-        self.to("cpu")
-        traced_script_module = torch.jit.script(self)
-        traced_script_module.save(path)
-
-
-class _OnnxPolicyExporter(torch.nn.Module):
-    """Exporter of actor-critic into ONNX file."""
-
-    def __init__(self, actor_critic, normalizer=None, verbose=False):
-        super().__init__()
-        self.verbose = verbose
-        self.actor = copy.deepcopy(actor_critic.actor)
-        self.is_recurrent = actor_critic.is_recurrent
-        if self.is_recurrent:
-            self.rnn = copy.deepcopy(actor_critic.memory_a.rnn)
-            self.rnn.cpu()
-            self.forward = self.forward_lstm
-        # copy normalizer if exists
-        if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
-        else:
-            self.normalizer = torch.nn.Identity()
-
-    def forward_lstm(self, x_in, h_in, c_in):
-        x_in = self.normalizer(x_in)
-        x, (h, c) = self.rnn(x_in.unsqueeze(0), (h_in, c_in))
-        x = x.squeeze(0)
-        return self.actor(x), h, c
-
-    def forward(self, x):
-        return self.actor(self.normalizer(x))
-
-    def export(self, path, filename):
-        self.to("cpu")
-        if self.is_recurrent:
-            obs = torch.zeros(1, self.rnn.input_size)
-            h_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
-            c_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
-            actions, h_out, c_out = self(obs, h_in, c_in)
-            torch.onnx.export(
-                self,
-                (obs, h_in, c_in),
-                os.path.join(path, filename),
-                export_params=True,
-                opset_version=18  # see  https://github.com/isaac-sim/IsaacLab/blob/ddb044eb5b2300792de41e82d53b032f3632b489/source/isaaclab_rl/isaaclab_rl/rsl_rl/exporter.py#L172.
-                verbose=self.verbose,
-                input_names=["obs", "h_in", "c_in"],
-                output_names=["actions", "h_out", "c_out"],
-                dynamic_axes={},
-            )
-        else:
-            obs = (
-                torch.zeros(1, self.actor.obs_dim)
-                if isinstance(self.actor, ActorMoE)
-                else torch.zeros(1, self.actor[0].in_features)
-            )
-            torch.onnx.export(
-                self,
-                obs,
-                os.path.join(path, filename),
-                export_params=True,
-                opset_version=18  # see  https://github.com/isaac-sim/IsaacLab/blob/ddb044eb5b2300792de41e82d53b032f3632b489/source/isaaclab_rl/isaaclab_rl/rsl_rl/exporter.py#L172.
-                verbose=self.verbose,
-                input_names=["obs"],
-                output_names=["actions"],
-                dynamic_axes={},
-            )
+    input_names = getattr(onnx_model, "input_names", ["obs"])
+    output_names = getattr(onnx_model, "output_names", ["actions"])
+    torch.onnx.export(
+        onnx_model,
+        dummy_inputs if len(dummy_inputs) > 1 else dummy_inputs[0],
+        os.path.join(path, filename),
+        export_params=True,
+        opset_version=18,
+        verbose=verbose,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes={},
+    )
