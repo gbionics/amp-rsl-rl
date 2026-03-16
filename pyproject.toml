@@ -44,10 +44,10 @@ examples = ["huggingface_hub"]
 mlflow = ["mlflow>=2.10.0"]
 
 [project.urls]
-Homepage = "https://github.com/ami-iit/amp-rsl-rl"
-Repository = "https://github.com/ami-iit/amp-rsl-rl"
-BugTracker = "https://github.com/ami-iit/amp-rsl-rl/issues"
-Changelog = "https://github.com/ami-iit/amp-rsl-rl/releases"
+Homepage = "https://github.com/gbionics/amp-rsl-rl"
+Repository = "https://github.com/gbionics/amp-rsl-rl"
+BugTracker = "https://github.com/gbionics/amp-rsl-rl/issues"
+Changelog = "https://github.com/gbionics/amp-rsl-rl/releases"
 
 [tool.setuptools_scm]
 local_scheme = "dirty-tag"
