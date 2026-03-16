@@ -131,6 +131,23 @@ class ReplayBuffer:
             batch_idx = indices[i * mini_batch_size : (i + 1) * mini_batch_size]
             yield self.states[batch_idx], self.next_states[batch_idx]
 
+    def state_dict(self) -> dict:
+        """Return a serialisable snapshot of the buffer contents."""
+        return {
+            "states": self.states[: self.num_samples].clone(),
+            "next_states": self.next_states[: self.num_samples].clone(),
+            "step": self.step,
+            "num_samples": self.num_samples,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the buffer from a snapshot produced by :meth:`state_dict`."""
+        n = state["num_samples"]
+        self.states[:n] = state["states"].to(self.device)
+        self.next_states[:n] = state["next_states"].to(self.device)
+        self.step = state["step"]
+        self.num_samples = n
+
     def __len__(self) -> int:
         """
         Return the number of valid samples currently stored in the buffer.

@@ -627,6 +627,7 @@ class AMPOnPolicyRunner:
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "amp_replay_buffer": self.alg.amp_storage.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -678,6 +679,9 @@ class AMPOnPolicyRunner:
             )
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        amp_replay_buffer = loaded_dict.get("amp_replay_buffer")
+        if amp_replay_buffer is not None:
+            self.alg.amp_storage.load_state_dict(amp_replay_buffer)
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
