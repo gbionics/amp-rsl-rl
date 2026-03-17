@@ -681,10 +681,10 @@ class AMPOnPolicyRunner:
             self.alg.discriminator.amp_normalizer.load_state_dict(
                 amp_normalizer_module.state_dict()
             )
-        if load_optimizer:
+        if load_optimizer and not weights_only:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         amp_replay_buffer = loaded_dict.get("amp_replay_buffer")
-        if amp_replay_buffer is not None:
+        if amp_replay_buffer is not None and not weights_only:
             self.alg.amp_storage.load_state_dict(amp_replay_buffer)
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
