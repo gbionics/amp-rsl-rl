@@ -622,15 +622,19 @@ class AMPOnPolicyRunner:
         """
         self._export_policy_fn = fn
 
-    def save(self, path, infos=None, save_onnx=False):
+    def save(self, path, infos=None, save_onnx=False, save_replay_buffer: bool = True):
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "discriminator_state_dict": self.alg.discriminator.state_dict(),
-            "amp_replay_buffer": self.alg.amp_storage.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+
+        # Optionally persist the AMP replay buffer, which can be large.
+        if save_replay_buffer:
+            saved_dict["amp_replay_buffer"] = self.alg.amp_storage.state_dict()
+
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
