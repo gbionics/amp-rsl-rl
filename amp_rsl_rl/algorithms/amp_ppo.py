@@ -13,13 +13,12 @@ import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
-# External modules providing the actor-critic model, storage utilities, and AMP components.
-from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer
 from amp_rsl_rl.networks import Discriminator
 from amp_rsl_rl.utils import AMPLoader
+from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
 
 
 class AMP_PPO:
@@ -32,8 +31,6 @@ class AMP_PPO:
 
     Parameters
     ----------
-    actor_critic : ActorCritic
-        Policy network providing ``act``/``evaluate``/``update_normalization`` APIs.
     discriminator : Discriminator
         AMP discriminator distinguishing expert vs policy motion pairs.
     amp_data : AMPLoader
@@ -70,13 +67,13 @@ class AMP_PPO:
         Torch device used by the module.
     """
 
-    actor_critic: ActorCritic
-
     def __init__(
         self,
-        actor_critic: ActorCritic,
         discriminator: Discriminator,
         amp_data: AMPLoader,
+        actor_critic=None,
+        actor=None,
+        critic=None,
         num_learning_epochs: int = 1,
         num_mini_batches: int = 1,
         clip_param: float = 0.2,
@@ -99,6 +96,24 @@ class AMP_PPO:
         self.schedule: str = schedule
         self.learning_rate: float = learning_rate
 
+        if RSL_RL_V4_PLUS:
+            if actor is None or critic is None:
+                raise ValueError(
+                    "rsl-rl-lib >= 4 detected: 'actor' and 'critic' must both be provided to AMP_PPO."
+                )
+            self.actor = actor.to(self.device)
+            self.critic = critic.to(self.device)
+            self.actor_critic = None
+        else:
+            if actor_critic is None:
+                raise ValueError(
+                    "rsl-rl-lib < 4 detected: 'actor_critic' must be provided to AMP_PPO."
+                )
+            # Set up the actor-critic (policy) and move it to the device.
+            self.actor_critic = actor_critic.to(self.device)
+            self.actor = self.actor_critic
+            self.critic = None
+
         # Set up the discriminator and move it to the appropriate device.
         self.discriminator: Discriminator = discriminator.to(self.device)
         self.amp_transition: RolloutStorage.Transition = RolloutStorage.Transition()
@@ -109,31 +124,44 @@ class AMP_PPO:
             obs_dim=obs_dim, buffer_size=amp_replay_buffer_size, device=device
         )
         self.amp_data: AMPLoader = amp_data
-
-        # Set up the actor-critic (policy) and move it to the device.
-        self.actor_critic = actor_critic
-        self.actor_critic.to(self.device)
         self.storage: Optional[RolloutStorage] = (
             None  # Will be initialized later once environment parameters are known
         )
 
         # Create optimizer for both the actor-critic and the discriminator.
         # Note: Weight decay is set differently for discriminator trunk and head.
-        params = [
-            {"params": self.actor_critic.parameters(), "name": "actor_critic"},
-            {
-                "params": self.discriminator.trunk.parameters(),
-                "weight_decay": 10e-4,
-                "name": "amp_trunk",
-            },
-            {
-                "params": self.discriminator.linear.parameters(),
-                "weight_decay": 10e-2,
-                "name": "amp_head",
-            },
-        ]
+        if RSL_RL_V4_PLUS:
+            params = [
+                {"params": self.actor.parameters(), "name": "actor"},
+                {"params": self.critic.parameters(), "name": "critic"},
+                {
+                    "params": self.discriminator.trunk.parameters(),
+                    "weight_decay": 10e-4,
+                    "name": "amp_trunk",
+                },
+                {
+                    "params": self.discriminator.linear.parameters(),
+                    "weight_decay": 10e-2,
+                    "name": "amp_head",
+                },
+            ]
+        else:
+            params = [
+                {"params": self.actor_critic.parameters(), "name": "actor_critic"},
+                {
+                    "params": self.discriminator.trunk.parameters(),
+                    "weight_decay": 10e-4,
+                    "name": "amp_trunk",
+                },
+                {
+                    "params": self.discriminator.linear.parameters(),
+                    "weight_decay": 10e-2,
+                    "name": "amp_head",
+                },
+            ]
         self.optimizer: optim.Adam = optim.Adam(params, lr=learning_rate)
         self.transition: RolloutStorage.Transition = RolloutStorage.Transition()
+
         # PPO-specific parameters
         self.clip_param: float = clip_param
         self.num_learning_epochs: int = num_learning_epochs
@@ -179,13 +207,21 @@ class AMP_PPO:
         """
         Sets the actor-critic model to evaluation mode.
         """
-        self.actor_critic.eval()
+        if RSL_RL_V4_PLUS:
+            self.actor.eval()
+            self.critic.eval()
+        else:
+            self.actor_critic.eval()
 
     def train_mode(self) -> None:
         """
         Sets the actor-critic model to training mode.
         """
-        self.actor_critic.train()
+        if RSL_RL_V4_PLUS:
+            self.actor.train()
+            self.critic.train()
+        else:
+            self.actor_critic.train()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Select an action and value estimate for the current observation.
@@ -200,16 +236,33 @@ class AMP_PPO:
         torch.Tensor
             Detached action tensor sampled from the actor-critic policy.
         """
-        if self.actor_critic.is_recurrent:
-            self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        if RSL_RL_V4_PLUS:
+            if self.actor.is_recurrent:
+                self.transition.hidden_states = self.actor.get_hidden_state()
+            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+            self.transition.values = self.critic(obs).detach()
+            self.transition.actions_log_prob = self.actor.get_output_log_prob(
+                self.transition.actions
+            ).detach()
+            if RSL_RL_V5_PLUS:
+                self.transition.distribution_params = [
+                    self.actor.output_mean.detach(),
+                    self.actor.output_std.detach(),
+                ]
+            else:
+                self.transition.action_mean = self.actor.output_mean.detach()
+                self.transition.action_sigma = self.actor.output_std.detach()
+        else:
+            if self.actor_critic.is_recurrent:
+                self.transition.hidden_states = self.actor_critic.get_hidden_states()
+            self.transition.actions = self.actor_critic.act(obs).detach()
+            self.transition.values = self.actor_critic.evaluate(obs).detach()
+            self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
+                self.transition.actions
+            ).detach()
+            self.transition.action_mean = self.actor_critic.action_mean.detach()
+            self.transition.action_sigma = self.actor_critic.action_std.detach()
 
-        self.transition.actions = self.actor_critic.act(obs).detach()
-        self.transition.values = self.actor_critic.evaluate(obs).detach()
-        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
-            self.transition.actions
-        ).detach()
-        self.transition.action_mean = self.actor_critic.action_mean.detach()
-        self.transition.action_sigma = self.actor_critic.action_std.detach()
         self.transition.observations = obs
         return self.transition.actions
 
@@ -243,7 +296,11 @@ class AMP_PPO:
         extras : dict[str, Any]
             Additional metadata from the environment (e.g. ``time_outs``).
         """
-        self.actor_critic.update_normalization(obs)
+        if RSL_RL_V4_PLUS:
+            self.actor.update_normalization(obs)
+            self.critic.update_normalization(obs)
+        else:
+            self.actor_critic.update_normalization(obs)
 
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
@@ -255,9 +312,15 @@ class AMP_PPO:
                 1,
             )
 
-        self.storage.add_transitions(self.transition)
-        self.transition.clear()
-        self.actor_critic.reset(dones)
+        if RSL_RL_V4_PLUS:
+            self.storage.add_transition(self.transition)
+            self.transition.clear()
+            self.actor.reset(dones)
+            self.critic.reset(dones)
+        else:
+            self.storage.add_transitions(self.transition)
+            self.transition.clear()
+            self.actor_critic.reset(dones)
 
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
         """Insert a policy-generated AMP transition into the replay buffer.
@@ -278,9 +341,29 @@ class AMP_PPO:
         obs : TensorDict
             Last observation gathered after rollout completion.
         """
-
-        last_values = self.actor_critic.evaluate(obs).detach()
-        self.storage.compute_returns(last_values, self.gamma, self.lam)
+        if RSL_RL_V4_PLUS:
+            last_values = self.critic(obs).detach()
+            st = self.storage
+            advantage = 0
+            for step in reversed(range(st.num_transitions_per_env)):
+                next_values = (
+                    last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+                )
+                next_is_not_terminal = 1.0 - st.dones[step].float()
+                delta = (
+                    st.rewards[step]
+                    + next_is_not_terminal * self.gamma * next_values
+                    - st.values[step]
+                )
+                advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                st.returns[step] = advantage + st.values[step]
+            st.advantages = st.returns - st.values
+            st.advantages = (st.advantages - st.advantages.mean()) / (
+                st.advantages.std() + 1e-8
+            )
+        else:
+            last_values = self.actor_critic.evaluate(obs).detach()
+            self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(
         self,
@@ -312,7 +395,9 @@ class AMP_PPO:
         mean_kl_divergence: float = 0.0
 
         # Create data generators for mini-batch sampling.
-        if self.actor_critic.is_recurrent:
+        _is_recurrent = self.actor.is_recurrent if RSL_RL_V4_PLUS else self.actor_critic.is_recurrent
+
+        if _is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
@@ -324,12 +409,13 @@ class AMP_PPO:
         # Generator for policy-generated AMP transitions.
         amp_policy_generator = self.amp_storage.feed_forward_generator(
             num_mini_batch=self.num_learning_epochs * self.num_mini_batches,
-            mini_batch_size=self.storage.num_envs
-            * self.storage.num_transitions_per_env
-            // self.num_mini_batches,
+            mini_batch_size=(
+                self.storage.num_envs
+                * self.storage.num_transitions_per_env
+                // self.num_mini_batches
+            ),
             allow_replacement=True,
         )
-
         # Generator for expert AMP data.
         amp_expert_generator = self.amp_data.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
@@ -343,36 +429,82 @@ class AMP_PPO:
             generator, amp_policy_generator, amp_expert_generator
         ):
             # Unpack the mini-batch sample from the environment.
-            (
-                obs_batch,
-                actions_batch,
-                target_values_batch,
-                advantages_batch,
-                returns_batch,
-                old_actions_log_prob_batch,
-                old_mu_batch,
-                old_sigma_batch,
-                hidden_states_batch,
-                masks_batch,
-            ) = sample
+            if hasattr(sample, "observations"):
+                obs_batch = sample.observations
+                actions_batch = sample.actions
+                target_values_batch = sample.values
+                advantages_batch = sample.advantages
+                returns_batch = sample.returns
+                old_actions_log_prob_batch = sample.old_actions_log_prob
+                old_mu_batch = sample.old_distribution_params[0]
+                old_sigma_batch = sample.old_distribution_params[1]
+                hidden_states_batch = sample.hidden_states
+                masks_batch = sample.masks
+            elif isinstance(sample, tuple) and len(sample) == 9:
+                (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_distribution_params_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                ) = sample
+                old_mu_batch = old_distribution_params_batch[0]
+                old_sigma_batch = old_distribution_params_batch[1]
+            else:
+                (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                ) = sample
 
             hidden_state_actor, hidden_state_critic = (None, None)
             if hidden_states_batch is not None:
                 hidden_state_actor, hidden_state_critic = hidden_states_batch
 
             # Forward pass through the actor to get current policy outputs.
-            self.actor_critic.act(
-                obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
-            )
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
-                actions_batch
-            )
-            value_batch = self.actor_critic.evaluate(
-                obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
-            )
-            mu_batch = self.actor_critic.action_mean
-            sigma_batch = self.actor_critic.action_std
-            entropy_batch = self.actor_critic.entropy
+            if RSL_RL_V4_PLUS:
+                _ = self.actor(
+                    obs_batch,
+                    masks=masks_batch,
+                    hidden_state=hidden_state_actor,
+                    stochastic_output=True,
+                )
+                actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
+                value_batch = self.critic(
+                    obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
+                )
+                if hasattr(self.actor, "get_distribution_params"):
+                    dist_params = self.actor.get_distribution_params()
+                    mu_batch = dist_params[0]
+                    sigma_batch = dist_params[1]
+                    entropy_batch = self.actor.get_entropy()
+                else:
+                    mu_batch = self.actor.output_mean
+                    sigma_batch = self.actor.output_std
+                    entropy_batch = self.actor.output_entropy
+            else:
+                # v3
+                self.actor_critic.act(
+                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
+                )
+                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+                value_batch = self.actor_critic.evaluate(
+                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
+                )
+                mu_batch = self.actor_critic.action_mean
+                sigma_batch = self.actor_critic.action_std
+                entropy_batch = self.actor_critic.entropy
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -484,7 +616,11 @@ class AMP_PPO:
             # Backpropagation and optimizer step.
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            if RSL_RL_V4_PLUS:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            else:
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad

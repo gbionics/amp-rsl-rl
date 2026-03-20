@@ -18,22 +18,34 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
-from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 import amp_rsl_rl
 from amp_rsl_rl.utils import AMPLoader
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
 from amp_rsl_rl.utils import export_policy_as_onnx
+from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, store_code_state, resolve_obs_groups
+
+if RSL_RL_V4_PLUS:
+    from rsl_rl.models import MLPModel
+    _v4_builtin_classes = {"MLPModel": MLPModel}
+else:
+    from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+    _v4_builtin_classes = {}
 
 # Built-in classes available for short-name resolution
 _BUILTIN_CLASSES = {
-    "ActorCritic": ActorCritic,
-    "ActorCriticRecurrent": ActorCriticRecurrent,
     "ActorCriticMoE": ActorCriticMoE,
     "AMP_PPO": AMP_PPO,
+    **_v4_builtin_classes,
 }
+if not RSL_RL_V4_PLUS:
+    _BUILTIN_CLASSES.update(
+        {
+            "ActorCritic": ActorCritic,
+            "ActorCriticRecurrent": ActorCriticRecurrent,
+        }
+    )
 
 
 def resolve_class(class_name: str) -> type:
@@ -175,7 +187,6 @@ class AMPOnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
         self.discriminator_cfg = train_cfg["discriminator"]
         self.dataset_cfg = train_cfg["dataset"]
         self.device = device
@@ -190,34 +201,68 @@ class AMPOnPolicyRunner:
             observations, self.cfg.get("obs_groups"), default_sets
         )
 
-        actor_critic_class = resolve_class(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
-            actor_critic_class(
+        if RSL_RL_V4_PLUS:
+            self.actor_cfg = train_cfg["actor"]
+            self.critic_cfg = train_cfg["critic"]
+            self.policy_cfg = {}
+
+            self.actor_cfg.pop("cnn_cfg", None)
+            self.critic_cfg.pop("cnn_cfg", None)
+            actor_class = resolve_class(self.actor_cfg.pop("class_name", "MLPModel"))
+            critic_class = resolve_class(self.critic_cfg.pop("class_name", "MLPModel"))
+
+            actor = actor_class(
+                observations,
+                self.cfg["obs_groups"],
+                "actor",
+                self.env.num_actions,
+                **self.actor_cfg,
+            ).to(self.device)
+            critic = critic_class(
+                observations,
+                self.cfg["obs_groups"],
+                "critic",
+                1,
+                **self.critic_cfg,
+            ).to(self.device)
+        else:
+            self.policy_cfg = train_cfg["policy"]
+            self.actor_cfg = {}
+            self.critic_cfg = {}
+
+            actor_critic_class = resolve_class(self.policy_cfg.pop("class_name"))
+            # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
+            actor_critic = actor_critic_class(
                 observations,
                 self.cfg["obs_groups"],
                 self.env.num_actions,
                 **self.policy_cfg,
             ).to(self.device)
-        )
-        # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
-        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params[
-            "asset_cfg"
-        ].joint_names
+
+        amp_joint_names = self.dataset_cfg.get("amp_joint_names", None)
+        if amp_joint_names is None and not RSL_RL_V4_PLUS:
+            try:
+                amp_joint_names = self.env.cfg.observations.amp.joint_pos.params[
+                    "asset_cfg"
+                ].joint_names
+            except AttributeError:
+                amp_joint_names = None
+
+        simulation_dt = self._resolve_simulation_dt()
 
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
-        num_amp_obs = observations["amp"].shape[1]
+        num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
         amp_data = AMPLoader(
             device=self.device,
             dataset_path_root=self.dataset_cfg["amp_data_path"],
             datasets=self.dataset_cfg["datasets"],
-            simulation_dt=self.env.cfg.sim.dt * self.env.cfg.decimation,
+            simulation_dt=simulation_dt,
             slow_down_factor=self.dataset_cfg["slow_down_factor"],
             expected_joint_names=amp_joint_names,
         )
 
         self.discriminator = Discriminator(
-            input_dim=num_amp_obs
-            * 2,  # the discriminator takes in the concatenation of the current and next observation
+            input_dim=num_amp_obs * 2,  # the discriminator takes in the concatenation of the current and next observation
             hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
             reward_scale=self.discriminator_cfg["reward_scale"],
             device=self.device,
@@ -236,15 +281,27 @@ class AMPOnPolicyRunner:
             if key not in AMP_PPO.__init__.__code__.co_varnames:
                 self.alg_cfg.pop(key)
 
-        self.alg: AMP_PPO = alg_class(
-            actor_critic=actor_critic,
-            discriminator=self.discriminator,
-            amp_data=amp_data,
-            device=self.device,
-            **self.alg_cfg,
-        )
+        if RSL_RL_V4_PLUS:
+            self.alg: AMP_PPO = alg_class(
+                actor=actor,
+                critic=critic,
+                discriminator=self.discriminator,
+                amp_data=amp_data,
+                device=self.device,
+                **self.alg_cfg,
+            )
+        else:
+            self.alg: AMP_PPO = alg_class(
+                actor_critic=actor_critic,
+                discriminator=self.discriminator,
+                amp_data=amp_data,
+                device=self.device,
+                **self.alg_cfg,
+            )
+
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+
         # init storage and model
         obs_template = observations.clone().detach().to(self.device)
         self.alg.init_storage(
@@ -262,6 +319,39 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__, amp_rsl_rl.__file__]
+
+    @staticmethod
+    def _flatten_amp_obs(amp_obs) -> torch.Tensor:
+        if isinstance(amp_obs, torch.Tensor):
+            return amp_obs
+        if isinstance(amp_obs, dict):
+            if "joint_pos" in amp_obs and "joint_vel" in amp_obs:
+                return torch.cat([amp_obs["joint_pos"], amp_obs["joint_vel"]], dim=-1)
+            keys = sorted(amp_obs.keys())
+            return torch.cat([amp_obs[k] for k in keys], dim=-1)
+        if hasattr(amp_obs, "keys"):
+            if "joint_pos" in amp_obs and "joint_vel" in amp_obs:
+                return torch.cat([amp_obs["joint_pos"], amp_obs["joint_vel"]], dim=-1)
+            keys = sorted(amp_obs.keys())
+            return torch.cat([amp_obs[k] for k in keys], dim=-1)
+        raise TypeError(f"Unsupported AMP observation type: {type(amp_obs)}")
+
+    def _resolve_simulation_dt(self) -> float:
+        sim_cfg = getattr(self.env.cfg, "sim", None)
+        decimation = float(getattr(self.env.cfg, "decimation", 1))
+        base_dt = None
+        if sim_cfg is not None:
+            base_dt = getattr(sim_cfg, "dt", None)
+            if base_dt is None:
+                mujoco_cfg = getattr(sim_cfg, "mujoco", None)
+                if mujoco_cfg is not None:
+                    base_dt = getattr(mujoco_cfg, "timestep", None)
+        if base_dt is None:
+            raise AttributeError(
+                "Unable to resolve simulation dt from env config. Expected either "
+                "`env.cfg.sim.dt` or `env.cfg.sim.mujoco.timestep`."
+            )
+        return float(base_dt) * decimation
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -320,9 +410,10 @@ class AMPOnPolicyRunner:
                 self.writer = WandbSummaryWriter(
                     log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
                 )
-                update_run_name_with_sequence(
-                    prefix=self.cfg["wandb_kwargs"]["project"]
-                )
+                _wandb_project = self.cfg.get("wandb_project") or self.cfg.get(
+                    "wandb_kwargs", {}
+                ).get("project", "")
+                update_run_name_with_sequence(prefix=_wandb_project)
 
                 self.writer.log_config(
                     self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
@@ -348,7 +439,7 @@ class AMPOnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs = self.env.get_observations().to(self.device)
-        amp_obs = obs["amp"].clone()
+        amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -381,7 +472,7 @@ class AMPOnPolicyRunner:
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
 
-                    next_amp_obs = obs["amp"].clone()
+                    next_amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
                     style_rewards = self.discriminator.predict_reward(
                         amp_obs, next_amp_obs
                     )
@@ -484,10 +575,15 @@ class AMPOnPolicyRunner:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        if getattr(self.alg.actor_critic, "noise_std_type", "scalar") == "log":
-            mean_std_value = torch.exp(self.alg.actor_critic.log_std).mean()
+        _policy_ref = self.alg.actor if RSL_RL_V4_PLUS else self.alg.actor_critic
+        if hasattr(_policy_ref, "distribution") and hasattr(
+            _policy_ref.distribution, "std_param"
+        ):
+            mean_std_value = _policy_ref.distribution.std_param.mean()
+        elif getattr(_policy_ref, "noise_std_type", "scalar") == "log":
+            mean_std_value = torch.exp(_policy_ref.log_std).mean()
         else:
-            mean_std_value = self.alg.actor_critic.std.mean()
+            mean_std_value = _policy_ref.std.mean()
         fps = int(
             self.num_steps_per_env
             * self.env.num_envs
@@ -623,13 +719,23 @@ class AMPOnPolicyRunner:
         self._export_policy_fn = fn
 
     def save(self, path, infos=None, save_onnx=False):
-        saved_dict = {
-            "model_state_dict": self.alg.actor_critic.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "discriminator_state_dict": self.alg.discriminator.state_dict(),
-            "iter": self.current_learning_iteration,
-            "infos": infos,
-        }
+        if RSL_RL_V4_PLUS:
+            saved_dict = {
+                "actor_state_dict": self.alg.actor.state_dict(),
+                "critic_state_dict": self.alg.critic.state_dict(),
+                "optimizer_state_dict": self.alg.optimizer.state_dict(),
+                "discriminator_state_dict": self.alg.discriminator.state_dict(),
+                "iter": self.current_learning_iteration,
+                "infos": infos,
+            }
+        else:
+            saved_dict = {
+                "model_state_dict": self.alg.actor_critic.state_dict(),
+                "optimizer_state_dict": self.alg.optimizer.state_dict(),
+                "discriminator_state_dict": self.alg.discriminator.state_dict(),
+                "iter": self.current_learning_iteration,
+                "infos": infos,
+            }
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -640,16 +746,25 @@ class AMPOnPolicyRunner:
             # Save the model in ONNX format
             # extract the folder path
             onnx_folder = os.path.dirname(path)
-
             # extract the iteration number from the path. The path is expected to be in the format
             # model_{iteration}.pt
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
 
+            if RSL_RL_V4_PLUS:
+                _module = self.alg.actor
+            else:
+                _module = self.alg.actor_critic
+            _normalizer = getattr(
+                _module,
+                "actor_obs_normalizer",
+                getattr(_module, "obs_normalizer", None),
+            )
+
             _export_fn = self._export_policy_fn or export_policy_as_onnx
             _export_fn(
-                self.alg.actor_critic,
-                normalizer=self.alg.actor_critic.actor_obs_normalizer,
+                _module,
+                normalizer=_normalizer,
                 path=onnx_folder,
                 filename=onnx_model_name,
             )
@@ -660,39 +775,79 @@ class AMPOnPolicyRunner:
                     self.current_learning_iteration,
                 )
 
-    def load(self, path, load_optimizer=True, weights_only=False):
+    def load(self, path, load_optimizer=True, weights_only=False, load_cfg=None, strict=True, map_location=None, **kwargs):
+        if load_cfg is None:
+            load_cfg = {}
+        do_load_optimizer = load_cfg.get("optimizer", load_optimizer)
+
         loaded_dict = torch.load(
-            path, map_location=self.device, weights_only=weights_only
+            path,
+            map_location=(map_location if map_location is not None else self.device),
+            weights_only=weights_only,
         )
-        self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
-        discriminator_state = loaded_dict["discriminator_state_dict"]
-        self.alg.discriminator.load_state_dict(discriminator_state, strict=False)
+
+        if RSL_RL_V4_PLUS:
+            do_load_actor = load_cfg.get("actor", True)
+            do_load_critic = load_cfg.get("critic", True)
+            do_load_discriminator = load_cfg.get("discriminator", True)
+
+            if do_load_actor and "actor_state_dict" in loaded_dict:
+                actor_state = loaded_dict["actor_state_dict"]
+                if "std" in actor_state and "distribution.std_param" not in actor_state:
+                    actor_state["distribution.std_param"] = actor_state.pop("std")
+                self.alg.actor.load_state_dict(actor_state, strict=strict)
+            if do_load_critic and "critic_state_dict" in loaded_dict:
+                self.alg.critic.load_state_dict(
+                    loaded_dict["critic_state_dict"], strict=strict
+                )
+        else:
+            do_load_discriminator = load_cfg.get("discriminator", True)
+            if "model_state_dict" in loaded_dict:
+                self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+
+        if do_load_discriminator and "discriminator_state_dict" in loaded_dict:
+            discriminator_state = loaded_dict["discriminator_state_dict"]
+            self.alg.discriminator.load_state_dict(discriminator_state, strict=False)
 
         amp_normalizer_module = loaded_dict.get("amp_normalizer")
         if amp_normalizer_module is not None and getattr(
             self.alg.discriminator, "empirical_normalization", False
         ):
-            # Old checkpoints stored the empirical normalizer separately; hydrate it if present.
             self.alg.discriminator.amp_normalizer.load_state_dict(
                 amp_normalizer_module.state_dict()
             )
-        if load_optimizer:
+
+        if do_load_optimizer and "optimizer_state_dict" in loaded_dict:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-        self.current_learning_iteration = loaded_dict["iter"]
-        return loaded_dict["infos"]
+        if "iter" in loaded_dict:
+            self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict.get("infos")
 
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
-        if device is not None:
-            self.alg.actor_critic.to(device)
-        return self.alg.actor_critic.act_inference
+        if RSL_RL_V4_PLUS:
+            if device is not None:
+                self.alg.actor.to(device)
+            return lambda obs: self.alg.actor(obs, stochastic_output=False)
+        else:
+            if device is not None:
+                self.alg.actor_critic.to(device)
+            return self.alg.actor_critic.act_inference
 
     def train_mode(self):
-        self.alg.actor_critic.train()
+        if RSL_RL_V4_PLUS:
+            self.alg.actor.train()
+            self.alg.critic.train()
+        else:
+            self.alg.actor_critic.train()
         self.alg.discriminator.train()
 
     def eval_mode(self):
-        self.alg.actor_critic.eval()
+        if RSL_RL_V4_PLUS:
+            self.alg.actor.eval()
+            self.alg.critic.eval()
+        else:
+            self.alg.actor_critic.eval()
         self.alg.discriminator.eval()
 
     def add_git_repo_to_log(self, repo_file_path):

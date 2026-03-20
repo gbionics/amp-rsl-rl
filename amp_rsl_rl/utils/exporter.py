@@ -38,16 +38,43 @@ Helper Classes - Private.
 """
 
 
+def _clone_module(module):
+    """Clone a module using state_dict to avoid deepcopy issues with non-leaf tensors."""
+    import io
+    buffer = io.BytesIO()
+    torch.save(module, buffer)
+    buffer.seek(0)
+    return torch.load(buffer, map_location='cpu', weights_only=False)
+
+
 class _TorchPolicyExporter(torch.nn.Module):
     """Exporter of actor-critic into JIT file."""
 
     def __init__(self, actor_critic, normalizer=None):
         super().__init__()
-        self.actor = copy.deepcopy(actor_critic.actor)
-        self.is_recurrent = actor_critic.is_recurrent
+        self._is_mlp_model = False
+        # Handle both ActorCritic (v3) and direct actor module (v4+)
+        if hasattr(actor_critic, 'actor'):
+            actor = actor_critic.actor
+        else:
+            actor = actor_critic
+        
+        # Check if this is an MLPModel (v4+ style with mlp attribute)
+        if hasattr(actor, 'mlp'):
+            self._is_mlp_model = True
+            # Clone using torch.save/load to avoid deepcopy issues with non-leaf tensors
+            actor_clone = _clone_module(actor)
+            self.mlp = actor_clone.mlp
+            self.distribution = actor_clone.distribution
+            self.actor = None  # Not used for MLPModel
+        else:
+            self.actor = _clone_module(actor)
+            self.mlp = None
+            self.distribution = None
+            
+        self.is_recurrent = getattr(actor_critic, 'is_recurrent', False)
         if self.is_recurrent:
-            self.rnn = copy.deepcopy(actor_critic.memory_a.rnn)
-            self.rnn.cpu()
+            self.rnn = _clone_module(actor_critic.memory_a.rnn)
             self.register_buffer(
                 "hidden_state",
                 torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size),
@@ -59,7 +86,7 @@ class _TorchPolicyExporter(torch.nn.Module):
             self.reset = self.reset_memory
         # copy normalizer if exists
         if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
+            self.normalizer = _clone_module(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
 
@@ -72,7 +99,13 @@ class _TorchPolicyExporter(torch.nn.Module):
         return self.actor(x)
 
     def forward(self, x):
-        return self.actor(self.normalizer(x))
+        x = self.normalizer(x)
+        if self._is_mlp_model:
+            mlp_output = self.mlp(x)
+            if self.distribution is not None:
+                return self.distribution.deterministic_output(mlp_output)
+            return mlp_output
+        return self.actor(x)
 
     @torch.jit.export
     def reset(self):
@@ -96,15 +129,33 @@ class _OnnxPolicyExporter(torch.nn.Module):
     def __init__(self, actor_critic, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
-        self.actor = copy.deepcopy(actor_critic.actor)
-        self.is_recurrent = actor_critic.is_recurrent
+        self._is_mlp_model = False
+        # Handle both ActorCritic (v3) and direct actor module (v4+)
+        if hasattr(actor_critic, 'actor'):
+            actor = actor_critic.actor
+        else:
+            actor = actor_critic
+        
+        # Check if this is an MLPModel (v4+ style with mlp attribute)
+        if hasattr(actor, 'mlp'):
+            self._is_mlp_model = True
+            # Clone using torch.save/load to avoid deepcopy issues with non-leaf tensors
+            actor_clone = _clone_module(actor)
+            self.mlp = actor_clone.mlp
+            self.distribution = actor_clone.distribution
+            self.actor = None  # Not used for MLPModel
+        else:
+            self.actor = _clone_module(actor)
+            self.mlp = None
+            self.distribution = None
+            
+        self.is_recurrent = getattr(actor_critic, 'is_recurrent', False)
         if self.is_recurrent:
-            self.rnn = copy.deepcopy(actor_critic.memory_a.rnn)
-            self.rnn.cpu()
+            self.rnn = _clone_module(actor_critic.memory_a.rnn)
             self.forward = self.forward_lstm
         # copy normalizer if exists
         if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
+            self.normalizer = _clone_module(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
 
@@ -115,7 +166,13 @@ class _OnnxPolicyExporter(torch.nn.Module):
         return self.actor(x), h, c
 
     def forward(self, x):
-        return self.actor(self.normalizer(x))
+        x = self.normalizer(x)
+        if self._is_mlp_model:
+            mlp_output = self.mlp(x)
+            if self.distribution is not None:
+                return self.distribution.deterministic_output(mlp_output)
+            return mlp_output
+        return self.actor(x)
 
     def export(self, path, filename):
         self.to("cpu")
@@ -137,11 +194,17 @@ class _OnnxPolicyExporter(torch.nn.Module):
                 dynamo=False,
             )
         else:
-            obs = (
-                torch.zeros(1, self.actor.obs_dim)
-                if isinstance(self.actor, ActorMoE)
-                else torch.zeros(1, self.actor[0].in_features)
-            )
+            # Handle ActorMoE, MLPModel (v4+), and nn.Sequential (v3)
+            if self._is_mlp_model:
+                # For MLPModel, get input dimension from the MLP's first layer
+                obs_dim = self.mlp[0].in_features
+            elif isinstance(self.actor, ActorMoE):
+                obs_dim = self.actor.obs_dim
+            elif hasattr(self.actor, 'obs_dim'):
+                obs_dim = self.actor.obs_dim
+            else:
+                obs_dim = self.actor[0].in_features
+            obs = torch.zeros(1, obs_dim)
             torch.onnx.export(
                 self,
                 obs,
