@@ -181,6 +181,11 @@ class AMPOnPolicyRunner:
         self.device = device
         self.env = env
 
+        # if using symmetry then pass the environment config object
+        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
+            # this is used by the symmetry function for handling different observation terms
+            self.alg_cfg["symmetry_cfg"]["_env"] = env
+
         # Optional custom exporter function (set via set_export_policy_fn)
         self._export_policy_fn: Callable | None = None
 
@@ -213,6 +218,7 @@ class AMPOnPolicyRunner:
             simulation_dt=self.env.cfg.sim.dt * self.env.cfg.decimation,
             slow_down_factor=self.dataset_cfg["slow_down_factor"],
             expected_joint_names=amp_joint_names,
+            symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
         )
 
         self.discriminator = Discriminator(
@@ -223,6 +229,7 @@ class AMPOnPolicyRunner:
             device=self.device,
             loss_type=self.discriminator_cfg["loss_type"],
             empirical_normalization=self.discriminator_cfg["empirical_normalization"],
+            symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
         ).to(self.device)
 
         # Initialize the PPO algorithm
@@ -433,6 +440,7 @@ class AMPOnPolicyRunner:
                 mean_accuracy_policy,
                 mean_accuracy_expert,
                 mean_kl_divergence,
+                mean_symmetry_loss,
             ) = self.alg.update()
             stop = time.time()
             learn_time = stop - start
@@ -519,6 +527,7 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar(
             "Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"]
         )
+        self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
         self.writer.add_scalar(
             "Policy/mean_noise_std", mean_std_value.item(), locs["it"]
         )
@@ -569,6 +578,7 @@ class AMPOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
@@ -583,6 +593,7 @@ class AMPOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
