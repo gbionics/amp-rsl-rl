@@ -22,10 +22,8 @@ def _parse_ver(ver_str: str) -> tuple:
 
 try:
     _rsl_rl_version = version("rsl-rl-lib")
-    print(f"Detected rsl-rl version: {_rsl_rl_version}")
 except PackageNotFoundError:
     _rsl_rl_version = "3.0.0"
-    print("rsl-rl not found, defaulting to version 3.0.0 for compatibility checks")
 
 _VER: tuple = _parse_ver(_rsl_rl_version)
 RSL_RL_MAJOR: int = _VER[0]

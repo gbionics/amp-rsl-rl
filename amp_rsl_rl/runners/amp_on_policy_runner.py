@@ -138,7 +138,7 @@ class AMPOnPolicyRunner:
     a discriminator-based "style reward" from the expert dataset. This is combined
     with the environment reward as:
 
-        `reward = 0.5 * task_reward + 0.5 * style_reward`
+        `reward = (1-<style_weight>) * task_reward + <style_weight> * style_reward`
 
     This can be later generalized into a weighted or learned reward mixing policy.
 
@@ -191,6 +191,7 @@ class AMPOnPolicyRunner:
         self.dataset_cfg = train_cfg["dataset"]
         self.device = device
         self.env = env
+        self.style_weight = train_cfg.get("style_weight", 0.5)
 
         # Optional custom exporter function (set via set_export_policy_fn)
         self._export_policy_fn: Callable | None = None
@@ -206,10 +207,15 @@ class AMPOnPolicyRunner:
             self.critic_cfg = train_cfg["critic"]
             self.policy_cfg = {}
 
-            self.actor_cfg.pop("cnn_cfg", None)
-            self.critic_cfg.pop("cnn_cfg", None)
             actor_class = resolve_class(self.actor_cfg.pop("class_name", "MLPModel"))
             critic_class = resolve_class(self.critic_cfg.pop("class_name", "MLPModel"))
+
+            # Filter config dicts to only contain kwargs accepted by the resolved class
+            import inspect
+            actor_valid_keys = set(inspect.signature(actor_class.__init__).parameters.keys())
+            critic_valid_keys = set(inspect.signature(critic_class.__init__).parameters.keys())
+            self.actor_cfg = {k: v for k, v in self.actor_cfg.items() if k in actor_valid_keys}
+            self.critic_cfg = {k: v for k, v in self.critic_cfg.items() if k in critic_valid_keys}
 
             actor = actor_class(
                 observations,
@@ -480,7 +486,7 @@ class AMPOnPolicyRunner:
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    rewards = 0.5 * rewards + 0.5 * style_rewards
+                    rewards = (1 - self.style_weight) * rewards + self.style_weight * style_rewards
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)

@@ -26,7 +26,10 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         try:
             group = cfg['wandb_kwargs']["group"]
         except KeyError:
+            group = None
             warnings.warn("wandb_group not specified in the runner config. Using default group.")
+
+        notes = cfg.get('wandb_kwargs', {}).get('notes', None)
 
         # Initialize wandb
         wandb.init(
@@ -34,7 +37,7 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
             entity=entity, 
             name=run_name,
             group=group,
-            notes=cfg['wandb_kwargs']['notes'],
+            notes=notes,
         )
 
         # Add log directory to wandb
