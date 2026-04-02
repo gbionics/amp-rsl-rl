@@ -473,29 +473,19 @@ class AMP_PPO:
             # Symmetry data augmentation for PPO inputs
             num_aug = 1
             if self.symmetry and self.symmetry.get("use_data_augmentation", False):
+                num_aug = 2
                 aug_obs, aug_actions = self._apply_symmetry(
                     obs=obs_batch,
                     actions=actions_batch,
                     obs_type="policy",
                 )
-                num_aug = self._augment_batch_size(original_batch_size, aug_obs)
+                # num_aug = self._augment_batch_size(original_batch_size, aug_obs)
                 obs_batch = aug_obs
                 actions_batch = (
                     aug_actions
                     if aug_actions is not None
                     else self._repeat_along_batch(actions_batch, num_aug)
                 )
-
-                # aug_critic_obs, _ = self._apply_symmetry(
-                #     obs=critic_obs_batch,
-                #     actions=None,
-                #     obs_type="critic",
-                # )
-                # critic_obs_batch = (
-                #     aug_critic_obs
-                #     if aug_critic_obs is not None
-                #     else self._repeat_along_batch(critic_obs_batch, num_aug)
-                # )
 
                 old_actions_log_prob_batch = self._repeat_along_batch(
                     old_actions_log_prob_batch, num_aug
