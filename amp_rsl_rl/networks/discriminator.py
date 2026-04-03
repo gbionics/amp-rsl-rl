@@ -88,10 +88,10 @@ class Discriminator(nn.Module):
             )
 
         if self.symmetry_cfg is not None:
-            fn = self.symmetry_cfg.get("data_augmentation_func")
+            fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
             if isinstance(fn, str):
-                self.symmetry_cfg["data_augmentation_func"] = utils.string_to_callable(
-                    fn
+                self.symmetry_cfg["amp_dataset_augmentation_func"] = (
+                    utils.string_to_callable(fn)
                 )
 
     def apply_symmetry(
