@@ -203,9 +203,9 @@ class AMPLoader:
             dataset_path_root = Path(dataset_path_root)
         self.symmetry_cfg = symmetry_cfg
         if self.symmetry_cfg is not None:
-            fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
+            fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
             if isinstance(fn, str):
-                self.symmetry_cfg["amp_dataset_augmentation_func"] = (
+                self.symmetry_cfg.amp_dataset_augmentation_func = (
                     utils.string_to_callable(fn)
                 )
 
@@ -246,6 +246,7 @@ class AMPLoader:
         # Precompute flat buffers for fast sampling
         obs_list, next_obs_list, reset_states = [], [], []
         augmented_lengths: List[int] = []
+        original_lengths: List[int] = []
         for data, w in zip(self.motion_data, self.dataset_weights):
             T = len(data)
             idx = torch.arange(T, device=self.device)
@@ -253,8 +254,8 @@ class AMPLoader:
             next_idx = torch.clamp(idx + 1, max=T - 1)
             next_obs = data.get_amp_dataset_obs(next_idx)
 
-            if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_amp_dataset_augmentation", False
+            if self.symmetry_cfg and getattr(
+                self.symmetry_cfg, "use_amp_dataset_augmentation", False
             ):
                 obs = self._apply_symmetry(obs, obs_type="amp")
                 next_obs = self._apply_symmetry(next_obs, obs_type="amp")
@@ -265,24 +266,33 @@ class AMPLoader:
 
             quat, jp, jv, blv, bav = data.get_state_for_reset(idx)
             reset_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
+            original_lengths.append(T)
 
         self.all_obs = torch.cat(obs_list, dim=0)
         self.all_next_obs = torch.cat(next_obs_list, dim=0)
         self.all_states = torch.cat(reset_states, dim=0)
 
-        # Build per-frame sampling weights: weight_i / length_i
-        lengths = [length for length in augmented_lengths]
+        # Build per-frame sampling weights for obs: weight_i / length_i
         per_frame = torch.cat(
             [
                 torch.full((L,), w / L, device=self.device)
-                for w, L in zip(self.dataset_weights, lengths)
+                for w, L in zip(self.dataset_weights, augmented_lengths)
             ]
         )
         self.per_frame_weights = per_frame / per_frame.sum()
 
+        # Build separate weights for reset states (not augmented)
+        per_frame_reset = torch.cat(
+            [
+                torch.full((L,), w / L, device=self.device)
+                for w, L in zip(self.dataset_weights, original_lengths)
+            ]
+        )
+        self.per_frame_weights_reset = per_frame_reset / per_frame_reset.sum()
+
     def _apply_symmetry(self, tensor: torch.Tensor, obs_type: str) -> torch.Tensor:
 
-        fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
+        fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
         if fn is None:
             return tensor
 
@@ -292,7 +302,7 @@ class AMPLoader:
             kwargs["obs"] = tensor
         if "actions" in signature.parameters:
             kwargs["actions"] = None
-        env_ref = self.symmetry_cfg.get("_env")
+        env_ref = getattr(self.symmetry_cfg, "_env", None)
         if "env" in signature.parameters:
             kwargs["env"] = env_ref
         if "cfg" in signature.parameters and env_ref is not None:
@@ -466,7 +476,7 @@ class AMPLoader:
             Tuple of (quat, joint_positions, joint_velocities, base_lin_velocities, base_ang_velocities)
         """
         idx = torch.multinomial(
-            self.per_frame_weights, number_of_samples, replacement=True
+            self.per_frame_weights_reset, number_of_samples, replacement=True
         )
         full = self.all_states[idx]
         joint_dim = self.motion_data[0].joint_positions.shape[1]
