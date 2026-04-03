@@ -477,15 +477,11 @@ class AMP_PPO:
                 aug_obs, aug_actions = self._apply_symmetry(
                     obs=obs_batch,
                     actions=actions_batch,
-                    obs_type="policy",
+                    obs_type=["policy", "critic"],
                 )
                 # num_aug = self._augment_batch_size(original_batch_size, aug_obs)
                 obs_batch = aug_obs
-                actions_batch = (
-                    aug_actions
-                    if aug_actions is not None
-                    else self._repeat_along_batch(actions_batch, num_aug)
-                )
+                actions_batch = aug_actions
 
                 old_actions_log_prob_batch = self._repeat_along_batch(
                     old_actions_log_prob_batch, num_aug
