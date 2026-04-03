@@ -104,7 +104,7 @@ class Discriminator(nn.Module):
         ):
             return tensor
 
-        fn = self.symmetry_cfg.get("data_augmentation_func")
+        fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
         if fn is None:
             return tensor
 

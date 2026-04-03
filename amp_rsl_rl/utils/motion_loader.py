@@ -203,10 +203,10 @@ class AMPLoader:
             dataset_path_root = Path(dataset_path_root)
         self.symmetry_cfg = symmetry_cfg
         if self.symmetry_cfg is not None:
-            fn = self.symmetry_cfg.get("data_augmentation_func")
+            fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
             if isinstance(fn, str):
-                self.symmetry_cfg["data_augmentation_func"] = utils.string_to_callable(
-                    fn
+                self.symmetry_cfg["amp_dataset_augmentation_func"] = (
+                    utils.string_to_callable(fn)
                 )
 
         # ─── Parse dataset names and weights ───
@@ -254,7 +254,7 @@ class AMPLoader:
             next_obs = data.get_amp_dataset_obs(next_idx)
 
             if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_data_augmentation", False
+                "use_amp_dataset_augmentation", False
             ):
                 obs = self._apply_symmetry(obs, obs_type="amp")
                 next_obs = self._apply_symmetry(next_obs, obs_type="amp")
@@ -281,12 +281,8 @@ class AMPLoader:
         self.per_frame_weights = per_frame / per_frame.sum()
 
     def _apply_symmetry(self, tensor: torch.Tensor, obs_type: str) -> torch.Tensor:
-        if self.symmetry_cfg is None or not self.symmetry_cfg.get(
-            "use_data_augmentation", False
-        ):
-            return tensor
 
-        fn = self.symmetry_cfg.get("data_augmentation_func")
+        fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
         if fn is None:
             return tensor
 
