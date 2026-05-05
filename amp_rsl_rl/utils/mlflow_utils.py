@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from dataclasses import asdict
 
@@ -15,6 +16,19 @@ except ModuleNotFoundError:
     raise ModuleNotFoundError(
         "MLflow is required to log to MLflow. Install it with: pip install mlflow"
     ) from None
+
+from mlflow.utils.mlflow_tags import (
+    MLFLOW_GIT_BRANCH,
+    MLFLOW_GIT_COMMIT,
+    MLFLOW_GIT_DIRTY,
+    MLFLOW_GIT_REPO_URL,
+    MLFLOW_GIT_DIFF,
+)
+
+try:
+    import git as _git
+except ImportError:
+    _git = None
 
 
 class MLflowSummaryWriter(SummaryWriter):
@@ -53,20 +67,32 @@ class MLflowSummaryWriter(SummaryWriter):
         )
         mlflow.set_tracking_uri(tracking_uri)
 
-        # --- run name ---
-        run_name = mlflow_kwargs.get("run_name", os.path.split(log_dir)[-1])
+        # --- set experiment (must be done before searching runs) ---
+        mlflow.set_experiment(experiment_name)
+
+        # --- run name with auto-increment sequence ---
+        # Use run_name (if provided) as prefix, otherwise fall back to
+        # experiment_name. The prefix is appended with an incrementing number
+        # (e.g., "qdd-amp1", "qdd-amp2", ...), mirroring wandb behaviour.
+        prefix = mlflow_kwargs.get("run_name", experiment_name)
+        run_name = self._next_sequential_run_name(prefix)
 
         # --- tags / description ---
         tags = mlflow_kwargs.get("tags", {})
         notes = mlflow_kwargs.get("notes", "")
 
+        # --- inject git info into tags ---
+        git_tags = self._collect_git_tags()
+        # User-supplied tags take precedence over auto-detected ones
+        merged_tags = {**git_tags, **tags}
+
         # --- start (or resume) a run ---
-        mlflow.set_experiment(experiment_name)
         self._run = mlflow.start_run(
             run_name=run_name,
-            tags=tags,
+            tags=merged_tags,
             description=notes,
         )
+        print(f"MLflow run started: {run_name}")
 
         # Store log dir as a run param
         mlflow.log_param("log_dir", log_dir)
@@ -80,6 +106,107 @@ class MLflowSummaryWriter(SummaryWriter):
 
         # Keep track of already-logged video files (same pattern as wandb writer)
         self.video_files: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Run naming helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _next_sequential_run_name(prefix: str) -> str:
+        """Generate the next sequential run name for the active experiment.
+
+        Searches existing runs whose name starts with *prefix*, extracts
+        numeric suffixes, and returns ``prefix{max+1}``.
+        """
+        experiment = mlflow.get_experiment_by_name(prefix)
+        if experiment is None:
+            # First run ever in this experiment
+            return f"{prefix}1"
+
+        try:
+            runs_df = mlflow.search_runs(
+                [experiment.experiment_id],
+                output_format="pandas",
+            )
+        except Exception:
+            return f"{prefix}1"
+
+        if runs_df.empty or "tags.mlflow.runName" not in runs_df.columns:
+            return f"{prefix}1"
+
+        max_num = 0
+        pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+        for name in runs_df["tags.mlflow.runName"].dropna():
+            m = pattern.match(name)
+            if m:
+                num = int(m.group(1))
+                if num > max_num:
+                    max_num = num
+
+        return f"{prefix}{max_num + 1}"
+
+    # ------------------------------------------------------------------
+    # Git info helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _collect_git_tags() -> dict[str, str]:
+        """Auto-detect the git repo from CWD and return MLflow-native git tags.
+
+        Returns an empty dict if gitpython is not installed or no repo is found.
+        """
+        if _git is None:
+            warnings.warn(
+                "gitpython is not installed — git info will not be logged to MLflow. "
+                "Install it with: pip install gitpython"
+            )
+            return {}
+
+        try:
+            repo = _git.Repo(os.getcwd(), search_parent_directories=True)
+        except Exception:
+            warnings.warn(
+                "Could not find a git repository from the current working directory. "
+                "Git info will not be logged to MLflow."
+            )
+            return {}
+
+        git_tags: dict[str, str] = {}
+
+        # Commit SHA
+        try:
+            git_tags[MLFLOW_GIT_COMMIT] = repo.head.commit.hexsha
+        except Exception:
+            pass
+
+        # Branch name (may fail on detached HEAD)
+        try:
+            git_tags[MLFLOW_GIT_BRANCH] = repo.active_branch.name
+        except TypeError:
+            git_tags[MLFLOW_GIT_BRANCH] = "DETACHED_HEAD"
+
+        # Dirty status
+        try:
+            git_tags[MLFLOW_GIT_DIRTY] = str(repo.is_dirty())
+        except Exception:
+            pass
+
+        # Remote URL (origin)
+        try:
+            if repo.remotes:
+                git_tags[MLFLOW_GIT_REPO_URL] = repo.remotes.origin.url
+        except Exception:
+            pass
+
+        # Diff (truncated to 5000 chars — MLflow tag value limit)
+        try:
+            diff = repo.git.diff(repo.head.commit.tree)
+            max_tag_len = 5000
+            if len(diff) > max_tag_len:
+                diff = diff[:max_tag_len] + "\n... [truncated]"
+            git_tags[MLFLOW_GIT_DIFF] = diff
+        except Exception:
+            pass
+
+        return git_tags
 
     # ------------------------------------------------------------------
     # Config helpers

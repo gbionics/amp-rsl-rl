@@ -47,6 +47,11 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
 
         self.video_files = []
 
+        self.update_run_name_with_sequence(
+            prefix=cfg["wandb_kwargs"]["project"]
+        )
+
+
     # To save video files to wandb explicitly
     # Thanks to https://github.com/leggedrobotics/rsl_rl/pull/84    
     def add_video_files(self, log_dir: str, step: int):
@@ -66,3 +71,38 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
                             {"Video": wandb.Video(video_path, format="mp4")},
                             step = step
                         )
+
+    # Update the run name with a sequence number. This function is useful to
+    # replicate the same behaviour of rsl-rl-lib before v2.3.0
+    def update_run_name_with_sequence(self, prefix: str) -> None:
+        # Retrieve the current wandb run details (project and entity)
+        project = wandb.run.project
+        entity = wandb.run.entity
+
+        # Use wandb's API to list all runs in your project
+        api = wandb.Api()
+        runs = api.runs(f"{entity}/{project}")
+
+        max_num = 0
+        # Iterate through runs to extract the numeric suffix after the prefix.
+        for run in runs:
+            if run.name.startswith(prefix):
+                # Extract the numeric part from the run name.
+                numeric_suffix = run.name[
+                    len(prefix) :
+                ]  # e.g., from "prefix564", get "564"
+                try:
+                    run_num = int(numeric_suffix)
+                    if run_num > max_num:
+                        max_num = run_num
+                except ValueError:
+                    continue
+
+        # Increment to get the new run number
+        new_num = max_num + 1
+        new_run_name = f"{prefix}{new_num}"
+
+        # Update the wandb run's name
+        wandb.run.name = new_run_name
+        print("Updated run name to:", wandb.run.name)
+
