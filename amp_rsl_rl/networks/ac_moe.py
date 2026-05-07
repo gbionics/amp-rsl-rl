@@ -8,7 +8,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from rsl_rl.networks import EmpiricalNormalization
+try:
+    from rsl_rl.networks import EmpiricalNormalization
+except (ImportError, ModuleNotFoundError):
+    from rsl_rl.modules import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
 
 

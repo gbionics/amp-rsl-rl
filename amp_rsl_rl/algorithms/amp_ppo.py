@@ -14,7 +14,11 @@ import torch.optim as optim
 from tensordict import TensorDict
 
 # External modules providing the actor-critic model, storage utilities, and AMP components.
-from rsl_rl.modules import ActorCritic
+try:
+    from rsl_rl.modules import ActorCritic
+except ImportError:
+    # Use as type hint only
+    ActorCritic = object  # type: ignore[assignment,misc]
 from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer

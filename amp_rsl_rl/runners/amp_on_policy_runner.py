@@ -18,8 +18,17 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
-from rsl_rl.utils import resolve_obs_groups, store_code_state
+
+try:
+    from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+except ImportError:
+    ActorCritic = object  # type: ignore[assignment,misc]
+    ActorCriticRecurrent = object  # type: ignore[assignment,misc]
+from rsl_rl.utils import resolve_obs_groups
+try:
+    from rsl_rl.utils import store_code_state
+except ImportError:
+    store_code_state = None  # type: ignore[assignment]
 
 import amp_rsl_rl
 from amp_rsl_rl.utils import AMPLoader
@@ -444,7 +453,7 @@ class AMPOnPolicyRunner:
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                git_file_paths = store_code_state(self.log_dir, self.git_status_repos) if store_code_state is not None else []
                 # if possible store them to wandb
                 if (
                     self.logger_type in ["wandb", "neptune", "mlflow"]
