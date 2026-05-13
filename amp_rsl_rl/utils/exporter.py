@@ -5,7 +5,6 @@
 #
 # Code taken from https://github.com/isaac-sim/IsaacLab/blob/5716d5600a1a0e45345bc01342a70bd81fac7889/source/isaaclab_rl/isaaclab_rl/rsl_rl/exporter.py
 
-import copy
 import os
 import torch
 from amp_rsl_rl.networks import ActorMoE
@@ -39,7 +38,7 @@ Helper Classes - Private.
 
 
 def _clone_module(module):
-    """Clone a module using state_dict to avoid deepcopy issues with non-leaf tensors."""
+    """Clone a module by pickling via torch.save/torch.load to avoid deepcopy issues with non-leaf tensors."""
     import io
     buffer = io.BytesIO()
     torch.save(module, buffer)

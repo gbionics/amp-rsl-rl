@@ -12,10 +12,11 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         run_name = os.path.split(log_dir)[-1]
         
         # Thanks to https://github.com/leggedrobotics/rsl_rl/pull/80/
-        try:
-            project = cfg['wandb_kwargs']["project"]
-        except KeyError:
-            raise KeyError("Please specify wandb_project in the runner config, e.g. legged_gym.") from None
+        project = cfg.get('wandb_project') or cfg.get('wandb_kwargs', {}).get('project')
+        if project is None:
+            raise KeyError(
+                "Please specify 'wandb_project' or 'wandb_kwargs.project' in the runner config."
+            ) from None
 
         try:
             entity = cfg['wandb_kwargs']["entity"]

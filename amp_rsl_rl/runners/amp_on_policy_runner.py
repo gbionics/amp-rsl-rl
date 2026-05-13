@@ -10,6 +10,7 @@ import importlib
 import os
 import statistics
 import time
+import warnings
 from collections import deque
 from typing import Callable
 
@@ -205,7 +206,7 @@ class AMPOnPolicyRunner:
         if RSL_RL_V4_PLUS:
             self.actor_cfg = train_cfg["actor"]
             self.critic_cfg = train_cfg["critic"]
-            self.policy_cfg = {}
+            self.policy_cfg = {"actor": self.actor_cfg, "critic": self.critic_cfg}
 
             actor_class = resolve_class(self.actor_cfg.pop("class_name", "MLPModel"))
             critic_class = resolve_class(self.critic_cfg.pop("class_name", "MLPModel"))
@@ -252,9 +253,27 @@ class AMPOnPolicyRunner:
                     "asset_cfg"
                 ].joint_names
             except AttributeError:
+                warnings.warn(
+                    "Could not resolve amp_joint_names from "
+                    "env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names. "
+                    "Falling back to None. Set 'amp_joint_names' in dataset_cfg explicitly "
+                    "to silence this warning.",
+                    stacklevel=2,
+                )
                 amp_joint_names = None
 
-        simulation_dt = self._resolve_simulation_dt()
+        sim_cfg = getattr(self.env.cfg, "sim", None)
+        if sim_cfg is None or not hasattr(sim_cfg, "dt"):
+            raise AttributeError(
+                "env.cfg.sim.dt is not set. Please ensure your environment config "
+                "defines `sim.dt` (the simulation timestep)."
+            )
+        if not hasattr(self.env.cfg, "decimation"):
+            raise AttributeError(
+                "env.cfg.decimation is not set. Please ensure your environment config "
+                "defines `decimation` (the action repeat factor)."
+            )
+        simulation_dt = self.env.cfg.sim.dt * self.env.cfg.decimation
 
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
         num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
@@ -342,23 +361,6 @@ class AMPOnPolicyRunner:
             return torch.cat([amp_obs[k] for k in keys], dim=-1)
         raise TypeError(f"Unsupported AMP observation type: {type(amp_obs)}")
 
-    def _resolve_simulation_dt(self) -> float:
-        sim_cfg = getattr(self.env.cfg, "sim", None)
-        decimation = float(getattr(self.env.cfg, "decimation", 1))
-        base_dt = None
-        if sim_cfg is not None:
-            base_dt = getattr(sim_cfg, "dt", None)
-            if base_dt is None:
-                mujoco_cfg = getattr(sim_cfg, "mujoco", None)
-                if mujoco_cfg is not None:
-                    base_dt = getattr(mujoco_cfg, "timestep", None)
-        if base_dt is None:
-            raise AttributeError(
-                "Unable to resolve simulation dt from env config. Expected either "
-                "`env.cfg.sim.dt` or `env.cfg.sim.mujoco.timestep`."
-            )
-        return float(base_dt) * decimation
-
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
@@ -419,7 +421,8 @@ class AMPOnPolicyRunner:
                 _wandb_project = self.cfg.get("wandb_project") or self.cfg.get(
                     "wandb_kwargs", {}
                 ).get("project", "")
-                update_run_name_with_sequence(prefix=_wandb_project)
+                if _wandb_project:
+                    update_run_name_with_sequence(prefix=_wandb_project)
 
                 self.writer.log_config(
                     self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
@@ -816,8 +819,10 @@ class AMPOnPolicyRunner:
             self.alg.discriminator.load_state_dict(discriminator_state, strict=False)
 
         amp_normalizer_module = loaded_dict.get("amp_normalizer")
-        if amp_normalizer_module is not None and getattr(
-            self.alg.discriminator, "empirical_normalization", False
+        if (
+            do_load_discriminator
+            and amp_normalizer_module is not None
+            and getattr(self.alg.discriminator, "empirical_normalization", False)
         ):
             self.alg.discriminator.amp_normalizer.load_state_dict(
                 amp_normalizer_module.state_dict()

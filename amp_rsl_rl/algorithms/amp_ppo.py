@@ -342,6 +342,8 @@ class AMP_PPO:
             Last observation gathered after rollout completion.
         """
         if RSL_RL_V4_PLUS:
+            # v4+ removed compute_returns from RolloutStorage
+            # (see https://github.com/leggedrobotics/rsl_rl/pull/137)
             last_values = self.critic(obs).detach()
             st = self.storage
             advantage = 0
