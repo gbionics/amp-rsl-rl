@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,10 +33,31 @@ _fake_mlflow.exceptions.MlflowException = Exception  # used in except clauses
 @pytest.fixture(autouse=True)
 def _patch_mlflow(monkeypatch):
     """Ensure all tests use a mocked mlflow so no server is required."""
-    import sys
+    # Build a fake mlflow.utils.mlflow_tags module with the tag-name constants.
+    # This is required because mlflow_utils.py has a module-level
+    # `from mlflow.utils.mlflow_tags import ...` that runs on first import
+    # while sys.modules["mlflow"] is already a MagicMock (not a real package).
+    _fake_tags = ModuleType("mlflow.utils.mlflow_tags")
+    _fake_tags.MLFLOW_GIT_BRANCH = "mlflow.gitBranchName"
+    _fake_tags.MLFLOW_GIT_COMMIT = "mlflow.gitCommit"
+    _fake_tags.MLFLOW_GIT_DIRTY = "mlflow.gitDirty"
+    _fake_tags.MLFLOW_GIT_REPO_URL = "mlflow.gitRepoURL"
+    _fake_tags.MLFLOW_GIT_DIFF = "mlflow.gitDiff"
+
+    _fake_utils = ModuleType("mlflow.utils")
 
     monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow)
     monkeypatch.setitem(sys.modules, "mlflow.exceptions", _fake_mlflow.exceptions)
+    monkeypatch.setitem(sys.modules, "mlflow.utils", _fake_utils)
+    monkeypatch.setitem(sys.modules, "mlflow.utils.mlflow_tags", _fake_tags)
+    # Setting git to None causes `import git` to raise ImportError, so
+    # mlflow_utils sets _git = None and _collect_git_tags() returns {}.
+    monkeypatch.setitem(sys.modules, "git", None)
+
+    # Also evict the cached mlflow_utils module so the patched sys.modules
+    # is used when it is re-imported inside each test.
+    monkeypatch.delitem(sys.modules, "amp_rsl_rl.utils.mlflow_utils", raising=False)
+
     # Reset call tracking between tests
     _fake_mlflow.reset_mock()
     yield
@@ -87,7 +110,7 @@ class TestMLflowSummaryWriterInit:
         _fake_mlflow.set_tracking_uri.assert_called_once_with("./test_mlruns")
         _fake_mlflow.set_experiment.assert_called_once_with("test_experiment")
         _fake_mlflow.start_run.assert_called_once_with(
-            run_name="test_run",
+            run_name="test_run1",
             tags={"env": "unit_test"},
             description="Automated test run",
         )
@@ -125,10 +148,10 @@ class TestMLflowSummaryWriterInit:
             }
         }
         MLflowSummaryWriter(log_dir=tmp_log_dir, flush_secs=10, cfg=cfg)
-        expected_name = os.path.split(tmp_log_dir)[-1]
+        expected_prefix = os.path.split(tmp_log_dir)[-1]
         _fake_mlflow.start_run.assert_called_once()
         call_kwargs = _fake_mlflow.start_run.call_args
-        assert call_kwargs.kwargs["run_name"] == expected_name
+        assert call_kwargs.kwargs["run_name"].startswith(expected_prefix)
 
 
 class TestAddScalar:

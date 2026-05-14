@@ -8,15 +8,7 @@ import re
 import warnings
 from dataclasses import asdict
 
-from torch.utils.tensorboard import SummaryWriter
-
-try:
-    import mlflow
-except ModuleNotFoundError:
-    raise ModuleNotFoundError(
-        "MLflow is required to log to MLflow. Install it with: pip install mlflow"
-    ) from None
-
+import mlflow
 from mlflow.utils.mlflow_tags import (
     MLFLOW_GIT_BRANCH,
     MLFLOW_GIT_COMMIT,
@@ -24,6 +16,7 @@ from mlflow.utils.mlflow_tags import (
     MLFLOW_GIT_REPO_URL,
     MLFLOW_GIT_DIFF,
 )
+from torch.utils.tensorboard import SummaryWriter
 
 try:
     import git as _git
