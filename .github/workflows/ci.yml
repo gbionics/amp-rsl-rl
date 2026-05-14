@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "rsl-rl-lib==${{ matrix.rsl-rl-version }}"
-          pip install -e ".[examples,mlflow]"
+          pip install -e ".[examples,mlflow,wandb]"
           pip install pytest
 
       - name: 🧪 Run tests
