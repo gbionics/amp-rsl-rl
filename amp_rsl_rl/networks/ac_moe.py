@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from rsl_rl.networks import EmpiricalNormalization
+from amp_rsl_rl.utils._compat import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
 
 
