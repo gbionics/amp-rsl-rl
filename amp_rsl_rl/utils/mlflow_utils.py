@@ -37,8 +37,7 @@ class MLflowSummaryWriter(SummaryWriter):
     - ``"experiment_name"`` (required): MLflow experiment name.
     - ``"tracking_uri"`` (optional): MLflow tracking URI. Falls back to the
       ``MLFLOW_TRACKING_URI`` environment variable or ``"./mlruns"``.
-    - ``"run_name"`` (optional): explicit run name; defaults to the last
-      component of *log_dir*.
+    - ``"run_name"`` (optional): explicit run name; defaults to ``experiment_name``.
     - ``"tags"`` (optional): dict of tags forwarded to ``mlflow.start_run``.
     - ``"notes"`` (optional): description string stored as the run description.
     """

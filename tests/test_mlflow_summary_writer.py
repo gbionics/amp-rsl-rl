@@ -139,7 +139,7 @@ class TestMLflowSummaryWriterInit:
         MLflowSummaryWriter(log_dir=tmp_log_dir, flush_secs=10, cfg=cfg)
         _fake_mlflow.set_tracking_uri.assert_called_once_with("http://my-server:5000")
 
-    def test_run_name_defaults_to_log_dir_basename(self, tmp_log_dir: str):
+    def test_run_name_defaults_to_experiment_name(self, tmp_log_dir: str):
         from amp_rsl_rl.utils.mlflow_utils import MLflowSummaryWriter
 
         cfg: dict = {
@@ -148,7 +148,7 @@ class TestMLflowSummaryWriterInit:
             }
         }
         MLflowSummaryWriter(log_dir=tmp_log_dir, flush_secs=10, cfg=cfg)
-        expected_prefix = os.path.split(tmp_log_dir)[-1]
+        expected_prefix = cfg["mlflow_kwargs"]["experiment_name"]
         _fake_mlflow.start_run.assert_called_once()
         call_kwargs = _fake_mlflow.start_run.call_args
         assert call_kwargs.kwargs["run_name"].startswith(expected_prefix)
