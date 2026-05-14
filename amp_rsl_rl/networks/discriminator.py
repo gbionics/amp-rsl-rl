@@ -10,9 +10,8 @@ import torch
 import torch.nn as nn
 from torch import autograd
 from torch.nn import functional as F
-
 from rsl_rl.utils import utils
-from rsl_rl.networks import EmpiricalNormalization
+from amp_rsl_rl.utils._compat import EmpiricalNormalization
 
 
 class Discriminator(nn.Module):
