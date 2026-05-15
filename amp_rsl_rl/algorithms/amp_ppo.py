@@ -450,7 +450,9 @@ class AMP_PPO:
             advantage = 0
             for step in reversed(range(st.num_transitions_per_env)):
                 next_values = (
-                    last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+                    last_values
+                    if step == st.num_transitions_per_env - 1
+                    else st.values[step + 1]
                 )
                 next_is_not_terminal = 1.0 - st.dones[step].float()
                 delta = (
@@ -458,7 +460,9 @@ class AMP_PPO:
                     + next_is_not_terminal * self.gamma * next_values
                     - st.values[step]
                 )
-                advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                advantage = (
+                    delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                )
                 st.returns[step] = advantage + st.values[step]
             st.advantages = st.returns - st.values
             st.advantages = (st.advantages - st.advantages.mean()) / (
@@ -499,7 +503,11 @@ class AMP_PPO:
         mean_symmetry_loss: float = 0.0
 
         # Create data generators for mini-batch sampling.
-        _is_recurrent = self.actor.is_recurrent if RSL_RL_V4_PLUS else self.actor_critic.is_recurrent
+        _is_recurrent = (
+            self.actor.is_recurrent
+            if RSL_RL_V4_PLUS
+            else self.actor_critic.is_recurrent
+        )
 
         if _is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
@@ -624,21 +632,23 @@ class AMP_PPO:
                     sigma_batch = dist_params[1]
                     entropy_batch = self.actor.get_entropy()
                 else:
-                    mu_batch = self.actor.output_mean
-                    sigma_batch = self.actor.output_std
-                    entropy_batch = self.actor.output_entropy
+                    mu_batch = self.actor.output_mean[:original_batch_size]
+                    sigma_batch = self.actor.output_std[:original_batch_size]
+                    entropy_batch = self.actor.output_entropy[:original_batch_size]
             else:
                 # v3
                 self.actor_critic.act(
                     obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
                 )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                    actions_batch
+                )
                 value_batch = self.actor_critic.evaluate(
                     obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
                 )
-                mu_batch = self.actor_critic.action_mean
-                sigma_batch = self.actor_critic.action_std
-                entropy_batch = self.actor_critic.entropy
+                mu_batch = self.actor_critic.action_mean[:original_batch_size]
+                sigma_batch = self.actor_critic.action_std[:original_batch_size]
+                entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -805,7 +815,9 @@ class AMP_PPO:
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             else:
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    self.actor_critic.parameters(), self.max_grad_norm
+                )
             self.optimizer.step()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
