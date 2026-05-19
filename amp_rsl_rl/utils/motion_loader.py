@@ -269,8 +269,8 @@ class AMPLoader:
 
     Args:
         device: Target torch device ('cpu' or 'cuda')
-        dataset_path_root: Directory containing the .npy motion files
-        datasets: Dictionary mapping dataset names (without extension) to sampling weights (floats)
+        sources: List of dicts, each with "dataset_path" and "motions" keys.
+            Supports loading motions from multiple directories.
         simulation_dt: Timestep used by the simulator
         slow_down_factor: Integer factor to slow down original data
         expected_joint_names: (Optional) override for joint ordering
@@ -279,13 +279,13 @@ class AMPLoader:
     def __init__(
         self,
         device: str,
-        dataset_path_root: Path,
-        datasets: Dict[str, float],
         simulation_dt: float,
         slow_down_factor: int,
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        *,
+        sources: List[Dict[str, Any]],
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
@@ -299,16 +299,26 @@ class AMPLoader:
                     utils.string_to_callable(fn)
                 )
 
-        # ─── Parse dataset names and weights ───
-        dataset_names = list(datasets.keys())
-        dataset_weights = list(datasets.values())
+        # ─── Resolve sources ───
+        resolved_sources = [
+            (Path(s["dataset_path"]), s["motions"]) for s in sources
+        ]
+
+        # ─── Flatten all sources into names, weights, paths ───
+        all_names: List[str] = []
+        all_weights: List[float] = []
+        all_paths: List[Path] = []
+        for root, ds in resolved_sources:
+            for name, weight in ds.items():
+                all_names.append(name)
+                all_weights.append(weight)
+                all_paths.append(root / f"{name}.npy")
 
         # ─── Build union of all joint names if not provided ───
         if expected_joint_names is None:
             joint_union: List[str] = []
             seen = set()
-            for name in dataset_names:
-                p = dataset_path_root / f"{name}.npy"
+            for p in all_paths:
                 info = np.load(str(p), allow_pickle=True).item()
                 for j in info["joints_list"]:
                     if j not in seen:
@@ -319,8 +329,7 @@ class AMPLoader:
 
         # Load and process each dataset into MotionData
         self.motion_data: List[MotionData] = []
-        for dataset_name in dataset_names:
-            dataset_path = dataset_path_root / f"{dataset_name}.npy"
+        for dataset_path in all_paths:
             md = self.load_data(
                 dataset_path,
                 simulation_dt,
@@ -330,7 +339,7 @@ class AMPLoader:
             self.motion_data.append(md)
 
         # Normalize dataset-level sampling weights
-        weights = torch.tensor(dataset_weights, dtype=torch.float32, device=self.device)
+        weights = torch.tensor(all_weights, dtype=torch.float32, device=self.device)
         self.dataset_weights = weights / weights.sum()
 
         # Precompute flat buffers for fast sampling

@@ -74,11 +74,10 @@ def main():
         t0 = time.perf_counter()
         loader = AMPLoader(
             device=device,
-            dataset_path_root=local_dir,
-            datasets=datasets,
             simulation_dt=simulation_dt,
             slow_down_factor=slow_down_factor,
             expected_joint_names=joint_names,
+            sources=[{"dataset_path": str(local_dir), "motions": datasets}],
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
