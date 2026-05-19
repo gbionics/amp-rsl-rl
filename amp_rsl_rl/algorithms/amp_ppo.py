@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union, Sequence
 
 import torch
 import torch.nn as nn
@@ -269,7 +269,7 @@ class AMP_PPO:
         *,
         obs: Optional[torch.Tensor],
         actions: Optional[torch.Tensor],
-        obs_type: Optional[str] = None,
+        obs_type: Union[str, Sequence[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Apply configured symmetry augmentation to observations/actions."""
 
