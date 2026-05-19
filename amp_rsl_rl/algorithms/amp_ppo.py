@@ -615,9 +615,9 @@ class AMP_PPO:
                 )
                 if hasattr(self.actor, "get_distribution_params"):
                     dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0]
-                    sigma_batch = dist_params[1]
-                    entropy_batch = self.actor.get_entropy()
+                    mu_batch = dist_params[0][:original_batch_size]
+                    sigma_batch = dist_params[1][:original_batch_size]
+                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
                 else:
                     mu_batch = self.actor.output_mean[:original_batch_size]
                     sigma_batch = self.actor.output_std[:original_batch_size]
