@@ -19,7 +19,7 @@ from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer
 from amp_rsl_rl.networks import Discriminator
-from amp_rsl_rl.utils import AMPLoader
+from amp_rsl_rl.utils import AMPLoader, _call_augmentation_func
 from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
 
 
@@ -280,29 +280,18 @@ class AMP_PPO:
         if aug_fn is None:
             return obs, actions
 
-        signature = inspect.signature(aug_fn)
-        kwargs: Dict[str, Any] = {}
-        if "obs" in signature.parameters:
-            kwargs["obs"] = obs
-        if "actions" in signature.parameters:
-            kwargs["actions"] = actions
-        env_ref = self.symmetry.get("_env")
-        if "env" in signature.parameters:
-            kwargs["env"] = env_ref
-        if "cfg" in signature.parameters and env_ref is not None:
-            kwargs["cfg"] = getattr(env_ref, "cfg", env_ref)
-        if obs_type is not None and "obs_type" in signature.parameters:
-            kwargs["obs_type"] = obs_type
+        aug_obs, aug_actions = _call_augmentation_func(
+            aug_fn,
+            obs=obs,
+            actions=actions,
+            env=self.symmetry.get("_env"),
+            obs_type=obs_type,
+        )
 
-        result = aug_fn(**kwargs)
-        if isinstance(result, tuple):
-            aug_obs, aug_actions = result
-        else:
-            aug_obs, aug_actions = result, None
-
-        aug_obs = aug_obs if aug_obs is not None else obs
-        aug_actions = aug_actions if aug_actions is not None else actions
-        return aug_obs, aug_actions
+        return (
+            aug_obs if aug_obs is not None else obs,
+            aug_actions if aug_actions is not None else actions,
+        )
 
     def test_mode(self) -> None:
         """

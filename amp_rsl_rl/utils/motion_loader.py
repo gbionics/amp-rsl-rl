@@ -55,6 +55,40 @@ def download_amp_dataset_from_hf(
     return dataset_names
 
 
+def _call_augmentation_func(
+    fn,
+    *,
+    obs: Optional[torch.Tensor] = None,
+    actions: Optional[torch.Tensor] = None,
+    env: Any = None,
+    obs_type: Any = None,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    parameters = inspect.signature(fn).parameters
+    kwargs: Dict[str, Any] = {}
+
+    if "obs" in parameters:
+        kwargs["obs"] = obs
+
+    if "actions" in parameters:
+        kwargs["actions"] = actions
+
+    if "env" in parameters:
+        kwargs["env"] = env
+
+    if "cfg" in parameters and env is not None:
+        kwargs["cfg"] = getattr(env, "cfg", env)
+
+    if "obs_type" in parameters and obs_type is not None:
+        kwargs["obs_type"] = obs_type
+
+    result = fn(**kwargs)
+
+    if isinstance(result, tuple):
+        return result
+
+    return result, None
+
+
 @dataclass
 class MotionData:
     """
@@ -290,33 +324,32 @@ class AMPLoader:
         )
         self.per_frame_weights_reset = per_frame_reset / per_frame_reset.sum()
 
-    def _apply_symmetry(self, tensor: torch.Tensor, obs_type: str) -> torch.Tensor:
+    def _apply_symmetry(
+        self,
+        *,
+        obs: Optional[torch.Tensor],
+        actions: Optional[torch.Tensor],
+        obs_type: Optional[Any] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.symmetry is None:
+            return obs, actions
 
-        fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
-        if fn is None:
-            return tensor
+        aug_fn = self.symmetry.get("data_augmentation_func")
+        if aug_fn is None:
+            return obs, actions
 
-        signature = inspect.signature(fn)
-        kwargs: Dict[str, Any] = {}
-        if "obs" in signature.parameters:
-            kwargs["obs"] = tensor
-        if "actions" in signature.parameters:
-            kwargs["actions"] = None
-        env_ref = getattr(self.symmetry_cfg, "_env", None)
-        if "env" in signature.parameters:
-            kwargs["env"] = env_ref
-        if "cfg" in signature.parameters and env_ref is not None:
-            kwargs["cfg"] = getattr(env_ref, "cfg", env_ref)
-        if "obs_type" in signature.parameters:
-            kwargs["obs_type"] = obs_type
+        aug_obs, aug_actions = _call_augmentation_func(
+            aug_fn,
+            obs=obs,
+            actions=actions,
+            env=self.symmetry.get("_env"),
+            obs_type=obs_type,
+        )
 
-        result = fn(**kwargs)
-        if isinstance(result, tuple):
-            augmented = result[0]
-        else:
-            augmented = result
-
-        return augmented if augmented is not None else tensor
+        return (
+            aug_obs if aug_obs is not None else obs,
+            aug_actions if aug_actions is not None else actions,
+        )
 
     def _resample_data_Rn(
         self,

@@ -96,10 +96,8 @@ class Discriminator(nn.Module):
     def apply_symmetry(
         self, tensor: torch.Tensor, obs_type: str = "amp"
     ) -> torch.Tensor:
-        """Applies the configured symmetry augmentation to the provided tensor."""
-
-        if self.symmetry_cfg is None or not self.symmetry_cfg.get(
-            "use_data_augmentation", False
+        if self.symmetry_cfg is None or self.symmetry_cfg.get(
+            "use_amp_dataset_augmentation", False
         ):
             return tensor
 
@@ -107,25 +105,13 @@ class Discriminator(nn.Module):
         if fn is None:
             return tensor
 
-        signature = inspect.signature(fn)
-        kwargs: Dict[str, Any] = {}
-        if "obs" in signature.parameters:
-            kwargs["obs"] = tensor
-        if "actions" in signature.parameters:
-            kwargs["actions"] = None
-        env_ref = self.symmetry_cfg.get("_env")
-        if "env" in signature.parameters:
-            kwargs["env"] = env_ref
-        if "cfg" in signature.parameters and env_ref is not None:
-            kwargs["cfg"] = getattr(env_ref, "cfg", env_ref)
-        if "obs_type" in signature.parameters:
-            kwargs["obs_type"] = obs_type
-
-        result = fn(**kwargs)
-        if isinstance(result, tuple):
-            augmented = result[0]
-        else:
-            augmented = result
+        augmented, _ = utils.call_augmentation_func(
+            fn,
+            obs=tensor,
+            actions=None,
+            env=self.symmetry_cfg.get("_env"),
+            obs_type=obs_type,
+        )
 
         return augmented if augmented is not None else tensor
 
