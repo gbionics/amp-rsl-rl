@@ -108,8 +108,7 @@ class AMPOnPolicyRunner:
     - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`
     - "discriminator": configuration for the AMP discriminator
     - "dataset": dictionary forwarded to `AMPLoader`, containing at least:
-        * "amp_data_path": folder with the `.npy` expert datasets
-        * "datasets": mapping of dataset name -> sampling weight (floats)
+        * "sources": list of {dataset_path, motions} dicts
         * "slow_down_factor": slowdown applied to real motion data to match sim dynamics
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
@@ -279,11 +278,10 @@ class AMPOnPolicyRunner:
         num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
         amp_data = AMPLoader(
             device=self.device,
-            dataset_path_root=self.dataset_cfg["amp_data_path"],
-            datasets=self.dataset_cfg["datasets"],
             simulation_dt=simulation_dt,
             slow_down_factor=self.dataset_cfg["slow_down_factor"],
             expected_joint_names=amp_joint_names,
+            sources=self.dataset_cfg["sources"],
         )
 
         self.discriminator = Discriminator(
