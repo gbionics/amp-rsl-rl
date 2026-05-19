@@ -7,7 +7,6 @@
 
 import os
 import torch
-from amp_rsl_rl.networks import ActorMoE
 
 
 def export_policy_as_onnx(
@@ -197,8 +196,6 @@ class _OnnxPolicyExporter(torch.nn.Module):
             if self._is_mlp_model:
                 # For MLPModel, get input dimension from the MLP's first layer
                 obs_dim = self.mlp[0].in_features
-            elif isinstance(self.actor, ActorMoE):
-                obs_dim = self.actor.obs_dim
             elif hasattr(self.actor, 'obs_dim'):
                 obs_dim = self.actor.obs_dim
             else:
