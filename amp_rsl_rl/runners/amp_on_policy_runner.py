@@ -21,7 +21,7 @@ import rsl_rl
 from rsl_rl.env import VecEnv
 
 import amp_rsl_rl
-from amp_rsl_rl.utils import AMPLoader
+from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
 from amp_rsl_rl.utils import export_policy_as_onnx
@@ -111,6 +111,8 @@ class AMPOnPolicyRunner:
         * "amp_data_path": folder with the `.npy` expert datasets
         * "datasets": mapping of dataset name -> sampling weight (floats)
         * "slow_down_factor": slowdown applied to real motion data to match sim dynamics
+        * "velocity_representation": (optional) "body_fixed" or "mixed" — frame convention
+          for base velocities in discriminator observations. Default: "body_fixed"
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
     - "empirical_normalization": (deprecated) legacy flag mirrored to `policy.actor_obs_normalization`
@@ -282,6 +284,11 @@ class AMPOnPolicyRunner:
 
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
         num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
+
+        # Resolve velocity representation for discriminator observations
+        vel_repr_str = self.dataset_cfg.get("velocity_representation", "body_fixed")
+        velocity_representation = VelocityRepresentation(vel_repr_str)
+
         amp_data = AMPLoader(
             device=self.device,
             dataset_path_root=self.dataset_cfg["amp_data_path"],
@@ -289,6 +296,7 @@ class AMPOnPolicyRunner:
             simulation_dt=simulation_dt,
             slow_down_factor=self.dataset_cfg["slow_down_factor"],
             expected_joint_names=amp_joint_names,
+            velocity_representation=velocity_representation,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
         )
 

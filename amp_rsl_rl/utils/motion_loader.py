@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from enum import Enum
 import inspect
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Dict, Optional, Any
@@ -13,6 +14,24 @@ import torch
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 from scipy.interpolate import interp1d
+
+
+class VelocityRepresentation(Enum):
+    """Velocity representation convention for base velocities.
+
+    Attributes:
+        BODY_FIXED_REPRESENTATION: Linear and angular velocities expressed in the
+            body-fixed (local) frame, i.e. using axes that rotate with the body.
+        MIXED_REPRESENTATION: Linear and angular velocities expressed using
+            world-aligned axes, but taken at the body origin. In other words, the
+            reference frame is attached to the body origin while its orientation
+            remains aligned with the world frame. This differs from
+            BODY_FIXED_REPRESENTATION, where the axes are attached to and rotate
+            with the body.
+    """
+
+    BODY_FIXED_REPRESENTATION = "body_fixed"
+    MIXED_REPRESENTATION = "mixed"
 
 
 def download_amp_dataset_from_hf(
@@ -151,16 +170,32 @@ class MotionData:
     def __len__(self) -> int:
         return self.joint_positions.shape[0]
 
-    def get_amp_dataset_obs(self, indices: torch.Tensor) -> torch.Tensor:
+    def get_amp_dataset_obs(
+        self,
+        indices: torch.Tensor,
+        velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+    ) -> torch.Tensor:
         """
         Returns the AMP observation tensor for given indices.
 
         Args:
             indices: indices of samples to retrieve
+            velocity_representation: which frame convention to use for the base
+                velocities in the observation. Defaults to BODY_FIXED_REPRESENTATION.
 
         Returns:
             Concatenated observation tensor
         """
+        if velocity_representation == VelocityRepresentation.MIXED_REPRESENTATION:
+            return torch.cat(
+                (
+                    self.joint_positions[indices],
+                    self.joint_velocities[indices],
+                    self.base_lin_velocities_mixed[indices],
+                    self.base_ang_velocities_mixed[indices],
+                ),
+                dim=1,
+            )
         return torch.cat(
             (
                 self.joint_positions[indices],
@@ -171,16 +206,31 @@ class MotionData:
             dim=1,
         )
 
-    def get_state_for_reset(self, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    def get_state_for_reset(
+        self,
+        indices: torch.Tensor,
+        velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+    ) -> Tuple[torch.Tensor, ...]:
         """
         Returns the full state needed for environment reset.
 
         Args:
             indices: indices of samples to retrieve
+            velocity_representation: which frame convention to use for the returned
+                base velocities. Defaults to BODY_FIXED_REPRESENTATION for backward
+                compatibility.
 
         Returns:
             Tuple of (quat, joint_positions, joint_velocities, base_lin_velocities, base_ang_velocities)
         """
+        if velocity_representation == VelocityRepresentation.MIXED_REPRESENTATION:
+            return (
+                self.base_quat[indices],
+                self.joint_positions[indices],
+                self.joint_velocities[indices],
+                self.base_lin_velocities_mixed[indices],
+                self.base_ang_velocities_mixed[indices],
+            )
         return (
             self.base_quat[indices],
             self.joint_positions[indices],
@@ -189,9 +239,13 @@ class MotionData:
             self.base_ang_velocities_local[indices],
         )
 
-    def get_random_sample_for_reset(self, items: int = 1) -> Tuple[torch.Tensor, ...]:
+    def get_random_sample_for_reset(
+        self,
+        items: int = 1,
+        velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+    ) -> Tuple[torch.Tensor, ...]:
         indices = torch.randint(0, len(self), (items,), device=self.device)
-        return self.get_state_for_reset(indices)
+        return self.get_state_for_reset(indices, velocity_representation)
 
 
 class AMPLoader:
@@ -231,8 +285,10 @@ class AMPLoader:
         slow_down_factor: int,
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
     ) -> None:
         self.device = device
+        self.velocity_representation = velocity_representation
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
         self.symmetry_cfg = symmetry_cfg
@@ -284,9 +340,9 @@ class AMPLoader:
         for data, w in zip(self.motion_data, self.dataset_weights):
             T = len(data)
             idx = torch.arange(T, device=self.device)
-            obs = data.get_amp_dataset_obs(idx)
+            obs = data.get_amp_dataset_obs(idx, self.velocity_representation)
             next_idx = torch.clamp(idx + 1, max=T - 1)
-            next_obs = data.get_amp_dataset_obs(next_idx)
+            next_obs = data.get_amp_dataset_obs(next_idx, self.velocity_representation)
 
             if self.symmetry_cfg and getattr(
                 self.symmetry_cfg, "use_amp_dataset_augmentation", False
@@ -298,7 +354,9 @@ class AMPLoader:
             next_obs_list.append(next_obs)
             augmented_lengths.append(obs.shape[0])
 
-            quat, jp, jv, blv, bav = data.get_state_for_reset(idx)
+            quat, jp, jv, blv, bav = data.get_state_for_reset(
+                idx, self.velocity_representation
+            )
             reset_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
             original_lengths.append(T)
 
@@ -498,10 +556,15 @@ class AMPLoader:
             )
             yield self.all_obs[idx], self.all_next_obs[idx]
 
-    def get_state_for_reset(self, number_of_samples: int) -> Tuple[torch.Tensor, ...]:
+    def get_state_for_reset(
+        self,
+        number_of_samples: int,
+    ) -> Tuple[torch.Tensor, ...]:
         """
         Randomly samples full states for environment resets,
         sampled directly from the precomputed state buffer.
+
+        The velocity representation used is the one specified at construction time.
 
         Args:
             number_of_samples: Number of samples to retrieve
