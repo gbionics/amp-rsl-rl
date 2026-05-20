@@ -290,7 +290,7 @@ class AMPLoader:
         self.dataset_weights = weights / weights.sum()
 
         # Precompute flat buffers for fast sampling
-        obs_list, next_obs_list, reset_states_local, reset_states_mixed = [], [], [], []
+        obs_list, next_obs_list, reset_states = [], [], []
         for data, w in zip(self.motion_data, self.dataset_weights):
             T = len(data)
             idx = torch.arange(T, device=self.device)
@@ -302,21 +302,13 @@ class AMPLoader:
             next_obs_list.append(next_obs)
 
             quat, jp, jv, blv, bav = data.get_state_for_reset(
-                idx, VelocityRepresentation.BODY_FIXED_REPRESENTATION
+                idx, self.velocity_representation
             )
-            reset_states_local.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
-
-            quat, jp, jv, blv, bav = data.get_state_for_reset(
-                idx, VelocityRepresentation.MIXED_REPRESENTATION
-            )
-            reset_states_mixed.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
+            reset_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
 
         self.all_obs = torch.cat(obs_list, dim=0)
         self.all_next_obs = torch.cat(next_obs_list, dim=0)
-        self.all_states = {
-            VelocityRepresentation.BODY_FIXED_REPRESENTATION: torch.cat(reset_states_local, dim=0),
-            VelocityRepresentation.MIXED_REPRESENTATION: torch.cat(reset_states_mixed, dim=0),
-        }
+        self.all_states = torch.cat(reset_states, dim=0)
 
         # Build per-frame sampling weights: weight_i / length_i
         lengths = [len(d) for d in self.motion_data]
@@ -478,24 +470,22 @@ class AMPLoader:
     def get_state_for_reset(
         self,
         number_of_samples: int,
-        velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Randomly samples full states for environment resets,
         sampled directly from the precomputed state buffer.
 
+        The velocity representation used is the one specified at construction time.
+
         Args:
             number_of_samples: Number of samples to retrieve
-            velocity_representation: which frame convention to use for the returned
-                base velocities. Defaults to BODY_FIXED_REPRESENTATION for backward
-                compatibility.
         Returns:
             Tuple of (quat, joint_positions, joint_velocities, base_lin_velocities, base_ang_velocities)
         """
         idx = torch.multinomial(
             self.per_frame_weights, number_of_samples, replacement=True
         )
-        full = self.all_states[velocity_representation][idx]
+        full = self.all_states[idx]
         joint_dim = self.motion_data[0].joint_positions.shape[1]
 
         # The dimensions of the full state are:
