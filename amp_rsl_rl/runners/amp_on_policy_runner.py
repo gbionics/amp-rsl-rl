@@ -21,8 +21,7 @@ import rsl_rl
 from rsl_rl.env import VecEnv
 
 import amp_rsl_rl
-from amp_rsl_rl.utils import AMPLoader
-from amp_rsl_rl.utils.motion_loader import VelocityRepresentation
+from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
 from amp_rsl_rl.utils import export_policy_as_onnx
