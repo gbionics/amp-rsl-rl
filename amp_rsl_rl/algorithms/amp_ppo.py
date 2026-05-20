@@ -6,18 +6,20 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Dict, Any
+import inspect
+from typing import Optional, Tuple, Dict, Any, Union, Sequence
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
+from rsl_rl.utils import string_to_callable
 from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer
 from amp_rsl_rl.networks import Discriminator
-from amp_rsl_rl.utils import AMPLoader
+from amp_rsl_rl.utils import AMPLoader, _call_augmentation_func
 from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
 
 
@@ -63,6 +65,10 @@ class AMP_PPO:
         Size of the replay buffer storing policy-generated AMP samples.
     use_smooth_ratio_clipping : bool, default=False
         Enables smooth ratio clipping instead of hard clamping.
+    normalize_advantage_per_mini_batch : bool, default=False
+        Whether to normalize advantages within each mini-batch (instead of the entire rollout).
+    symmetry_cfg : dict | None, default=None
+        Configuration dictionary enabling symmetry-based data augmentation and mirror loss.
     device : str, default="cpu"
         Torch device used by the module.
     """
@@ -88,6 +94,8 @@ class AMP_PPO:
         desired_kl: float = 0.01,
         amp_replay_buffer_size: int = 100000,
         use_smooth_ratio_clipping: bool = False,
+        normalize_advantage_per_mini_batch: bool = False,
+        symmetry_cfg: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
     ) -> None:
         # Set device and learning hyperparameters
@@ -95,6 +103,9 @@ class AMP_PPO:
         self.desired_kl: float = desired_kl
         self.schedule: str = schedule
         self.learning_rate: float = learning_rate
+        self.normalize_advantage_per_mini_batch: bool = (
+            normalize_advantage_per_mini_batch
+        )
 
         if RSL_RL_V4_PLUS:
             if actor is None or critic is None:
@@ -174,6 +185,32 @@ class AMP_PPO:
         self.use_clipped_value_loss: bool = use_clipped_value_loss
         self.use_smooth_ratio_clipping: bool = use_smooth_ratio_clipping
 
+        # Symmetry configuration for PPO and AMP augmentation
+        self.symmetry: Optional[Dict[str, Any]] = None
+        if symmetry_cfg is not None:
+            use_symmetry = symmetry_cfg.get(
+                "use_data_augmentation", False
+            ) or symmetry_cfg.get("use_mirror_loss", False)
+            if not use_symmetry:
+                print(
+                    "Symmetry configuration provided but neither data augmentation nor mirror loss are enabled."
+                    " Symmetry utilities will only be available for logging."
+                )
+            aug_fn = symmetry_cfg.get("data_augmentation_func")
+            if isinstance(aug_fn, str):
+                symmetry_cfg["data_augmentation_func"] = string_to_callable(aug_fn)
+            aug_fn = symmetry_cfg.get("data_augmentation_func")
+            if aug_fn is not None and not callable(aug_fn):
+                raise ValueError(
+                    "Symmetry configuration exists but the function is not callable: "
+                    f"{aug_fn}"
+                )
+            if getattr(actor_critic, "is_recurrent", False):
+                raise ValueError(
+                    "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
+                )
+            self.symmetry = symmetry_cfg
+
     def init_storage(
         self,
         num_envs: int,
@@ -201,6 +238,59 @@ class AMP_PPO:
             obs=observations,
             actions_shape=action_shape,
             device=self.device,
+        )
+
+    def _augment_batch_size(
+        self, original_size: int, augmented: Optional[torch.Tensor]
+    ) -> int:
+        """Compute augmentation factor given the original and augmented batch sizes."""
+
+        if augmented is None or original_size == 0:
+            return 1
+        if augmented.shape[0] % original_size != 0:
+            raise ValueError(
+                "Symmetry augmentation function returned a batch size incompatible with the original size."
+                f" Original={original_size}, augmented={augmented.shape[0]}"
+            )
+        return augmented.shape[0] // original_size
+
+    def _repeat_along_batch(
+        self, tensor: Optional[torch.Tensor], num_aug: int
+    ) -> Optional[torch.Tensor]:
+        """Repeat a tensor along the first dimension to match augmentation factor."""
+
+        if tensor is None or num_aug == 1:
+            return tensor
+        repeat_dims = [num_aug] + [1] * (tensor.dim() - 1)
+        return tensor.repeat(*repeat_dims)
+
+    def _apply_symmetry(
+        self,
+        *,
+        obs: Optional[torch.Tensor],
+        actions: Optional[torch.Tensor],
+        obs_type: Union[str, Sequence[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Apply configured symmetry augmentation to observations/actions."""
+
+        if self.symmetry is None:
+            return obs, actions
+
+        aug_fn = self.symmetry.get("data_augmentation_func")
+        if aug_fn is None:
+            return obs, actions
+
+        aug_obs, aug_actions = _call_augmentation_func(
+            aug_fn,
+            obs=obs,
+            actions=actions,
+            env=self.symmetry.get("_env"),
+            obs_type=obs_type,
+        )
+
+        return (
+            aug_obs if aug_obs is not None else obs,
+            aug_actions if aug_actions is not None else actions,
         )
 
     def test_mode(self) -> None:
@@ -349,7 +439,9 @@ class AMP_PPO:
             advantage = 0
             for step in reversed(range(st.num_transitions_per_env)):
                 next_values = (
-                    last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+                    last_values
+                    if step == st.num_transitions_per_env - 1
+                    else st.values[step + 1]
                 )
                 next_is_not_terminal = 1.0 - st.dones[step].float()
                 delta = (
@@ -357,7 +449,9 @@ class AMP_PPO:
                     + next_is_not_terminal * self.gamma * next_values
                     - st.values[step]
                 )
-                advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                advantage = (
+                    delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                )
                 st.returns[step] = advantage + st.values[step]
             st.advantages = st.returns - st.values
             st.advantages = (st.advantages - st.advantages.mean()) / (
@@ -369,7 +463,7 @@ class AMP_PPO:
 
     def update(
         self,
-    ) -> Tuple[float, float, float, float, float, float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float, float, float, float]:
         """
         Performs a single update step for both the actor-critic (PPO) and the AMP discriminator.
         It iterates over mini-batches of data, computes surrogate, value, AMP and gradient penalty losses,
@@ -381,7 +475,7 @@ class AMP_PPO:
             A tuple containing mean losses and statistics:
             (mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss,
              mean_policy_pred, mean_expert_pred, mean_accuracy_policy, mean_accuracy_expert,
-             mean_kl_divergence)
+             mean_kl_divergence, mean_symmetry_loss)
         """
         # Initialize mean loss and accuracy statistics.
         mean_value_loss: float = 0.0
@@ -395,9 +489,14 @@ class AMP_PPO:
         mean_accuracy_policy_elem: float = 0.0
         mean_accuracy_expert_elem: float = 0.0
         mean_kl_divergence: float = 0.0
+        mean_symmetry_loss: float = 0.0
 
         # Create data generators for mini-batch sampling.
-        _is_recurrent = self.actor.is_recurrent if RSL_RL_V4_PLUS else self.actor_critic.is_recurrent
+        _is_recurrent = (
+            self.actor.is_recurrent
+            if RSL_RL_V4_PLUS
+            else self.actor_critic.is_recurrent
+        )
 
         if _is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
@@ -474,6 +573,34 @@ class AMP_PPO:
             if hidden_states_batch is not None:
                 hidden_state_actor, hidden_state_critic = hidden_states_batch
 
+            original_batch_size = obs_batch.shape[0]
+
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1e-8
+                    )
+
+            # Symmetry data augmentation for PPO inputs
+            if self.symmetry and self.symmetry.get("use_data_augmentation", False):
+                aug_obs, aug_actions = self._apply_symmetry(
+                    obs=obs_batch,
+                    actions=actions_batch,
+                    obs_type=["policy", "critic"],
+                )
+                num_aug = self._augment_batch_size(original_batch_size, aug_obs)
+                obs_batch = aug_obs
+                actions_batch = aug_actions
+
+                old_actions_log_prob_batch = self._repeat_along_batch(
+                    old_actions_log_prob_batch, num_aug
+                )
+                target_values_batch = self._repeat_along_batch(
+                    target_values_batch, num_aug
+                )
+                advantages_batch = self._repeat_along_batch(advantages_batch, num_aug)
+                returns_batch = self._repeat_along_batch(returns_batch, num_aug)
+
             # Forward pass through the actor to get current policy outputs.
             if RSL_RL_V4_PLUS:
                 _ = self.actor(
@@ -488,25 +615,27 @@ class AMP_PPO:
                 )
                 if hasattr(self.actor, "get_distribution_params"):
                     dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0]
-                    sigma_batch = dist_params[1]
-                    entropy_batch = self.actor.get_entropy()
+                    mu_batch = dist_params[0][:original_batch_size]
+                    sigma_batch = dist_params[1][:original_batch_size]
+                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
                 else:
-                    mu_batch = self.actor.output_mean
-                    sigma_batch = self.actor.output_std
-                    entropy_batch = self.actor.output_entropy
+                    mu_batch = self.actor.output_mean[:original_batch_size]
+                    sigma_batch = self.actor.output_std[:original_batch_size]
+                    entropy_batch = self.actor.output_entropy[:original_batch_size]
             else:
                 # v3
                 self.actor_critic.act(
                     obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
                 )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                    actions_batch
+                )
                 value_batch = self.actor_critic.evaluate(
                     obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
                 )
-                mu_batch = self.actor_critic.action_mean
-                sigma_batch = self.actor_critic.action_std
-                entropy_batch = self.actor_critic.entropy
+                mu_batch = self.actor_critic.action_mean[:original_batch_size]
+                sigma_batch = self.actor_critic.action_std[:original_batch_size]
+                entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -572,9 +701,60 @@ class AMP_PPO:
                 - self.entropy_coef * entropy_batch.mean()
             )
 
+            # Mirror loss (if enabled)
+            symmetry_loss_value = torch.zeros(1, device=self.device)
+            if self.symmetry:
+                if not self.symmetry.get("use_data_augmentation", False):
+                    sym_obs_batch, _ = self._apply_symmetry(
+                        obs=obs_batch[:original_batch_size],
+                        actions=None,
+                        obs_type="policy",
+                    )
+                else:
+                    sym_obs_batch = obs_batch
+
+                if sym_obs_batch is not None:
+                    with torch.no_grad():
+                        sym_obs_detached = sym_obs_batch.detach().clone()
+                    mean_actions_batch = self.actor_critic.act_inference(
+                        sym_obs_detached
+                    )
+                    action_mean_orig = mean_actions_batch[:original_batch_size]
+                    _, sym_actions = self._apply_symmetry(
+                        obs=None,
+                        actions=action_mean_orig,
+                        obs_type="policy",
+                    )
+                    if sym_actions is None:
+                        sym_actions = mean_actions_batch
+                    mse_loss = torch.nn.MSELoss()
+                    symmetry_loss_value = mse_loss(
+                        mean_actions_batch[original_batch_size:],
+                        sym_actions.detach()[original_batch_size:],
+                    )
+                    if self.symmetry.get("use_mirror_loss", False):
+                        coeff = self.symmetry.get("mirror_loss_coeff", 0.0)
+                        ppo_loss = ppo_loss + coeff * symmetry_loss_value
+                    else:
+                        symmetry_loss_value = symmetry_loss_value.detach()
+
             # Process AMP loss by unpacking policy and expert AMP samples.
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
+
+            if self.symmetry and self.symmetry.get("use_data_augmentation", False):
+                policy_state = self.discriminator.apply_symmetry(
+                    policy_state, obs_type="amp"
+                )
+                policy_next_state = self.discriminator.apply_symmetry(
+                    policy_next_state, obs_type="amp"
+                )
+                expert_state = self.discriminator.apply_symmetry(
+                    expert_state, obs_type="amp"
+                )
+                expert_next_state = self.discriminator.apply_symmetry(
+                    expert_next_state, obs_type="amp"
+                )
 
             # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
             policy_state = policy_state.to(self.device)
@@ -622,7 +802,9 @@ class AMP_PPO:
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             else:
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    self.actor_critic.parameters(), self.max_grad_norm
+                )
             self.optimizer.step()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
@@ -644,6 +826,7 @@ class AMP_PPO:
             mean_grad_pen_loss += grad_pen_loss.item()
             mean_policy_pred += policy_d_prob.mean().item()
             mean_expert_pred += expert_d_prob.mean().item()
+            mean_symmetry_loss += symmetry_loss_value.item()
 
             # Calculate the accuracy of the discriminator.
             mean_accuracy_policy += torch.sum(
@@ -668,6 +851,7 @@ class AMP_PPO:
         mean_accuracy_policy /= max(1, mean_accuracy_policy_elem)
         mean_accuracy_expert /= max(1, mean_accuracy_expert_elem)
         mean_kl_divergence /= num_updates
+        mean_symmetry_loss /= num_updates
 
         # Clear the storage for the next update cycle.
         self.storage.clear()
@@ -682,4 +866,5 @@ class AMP_PPO:
             mean_accuracy_policy,
             mean_accuracy_expert,
             mean_kl_divergence,
+            mean_symmetry_loss,
         )
