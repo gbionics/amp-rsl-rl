@@ -18,9 +18,14 @@ class VelocityRepresentation(Enum):
     """Velocity representation convention for base velocities.
 
     Attributes:
-        BODY_FIXED_REPRESENTATION: Velocities expressed in the body (local) frame.
-        MIXED_REPRESENTATION: Linear velocity in world frame, angular velocity in world frame
-            (i.e., the frame is world-aligned but attached to the body origin).
+        BODY_FIXED_REPRESENTATION: Linear and angular velocities expressed in the
+            body-fixed (local) frame, i.e. using axes that rotate with the body.
+        MIXED_REPRESENTATION: Linear and angular velocities expressed using
+            world-aligned axes, but taken at the body origin. In other words, the
+            reference frame is attached to the body origin while its orientation
+            remains aligned with the world frame. This differs from
+            BODY_FIXED_REPRESENTATION, where the axes are attached to and rotate
+            with the body.
     """
 
     BODY_FIXED_REPRESENTATION = "body_fixed"
