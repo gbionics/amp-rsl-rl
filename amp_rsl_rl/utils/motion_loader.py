@@ -289,8 +289,6 @@ class AMPLoader:
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
-        if isinstance(dataset_path_root, str):
-            dataset_path_root = Path(dataset_path_root)
         self.symmetry_cfg = symmetry_cfg
         if self.symmetry_cfg is not None:
             fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
