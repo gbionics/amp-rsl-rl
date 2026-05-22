@@ -48,14 +48,13 @@ with tempfile.TemporaryDirectory() as tmpdirname:
     # DATASET PROCESSING WITH AMPLoader
     # =============================================
     # Initialize the AMPLoader to process and manage the motion data
+    datasets = {name: 1.0 for name in dataset_names}
     loader = AMPLoader(
         device="cpu",  # Use CPU for processing (change to "cuda" for GPU)
-        dataset_path_root=local_dir,  # Path to downloaded datasets
-        dataset_names=dataset_names,  # Names of the loaded datasets
-        dataset_weights=[1.0] * len(dataset_names),  # Equal weights for all motions
         simulation_dt=1 / 60.0,  # Simulation timestep (60Hz)
         slow_down_factor=1,  # Don't slow down the motions
         expected_joint_names=None,  # Use default joint ordering
+        sources=[{"dataset_path": str(local_dir), "motions": datasets}],
     )
 
     # =============================================
