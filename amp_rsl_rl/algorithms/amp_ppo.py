@@ -67,8 +67,8 @@ class AMP_PPO:
         Enables smooth ratio clipping instead of hard clamping.
     normalize_advantage_per_mini_batch : bool, default=False
         Whether to normalize advantages within each mini-batch (instead of the entire rollout).
-    symmetry_cfg : class | None, default=None
-        Configuration class enabling symmetry-based data augmentation and mirror loss.
+    symmetry_cfg : dict | None, default=None
+        Configuration dict enabling symmetry-based data augmentation and mirror loss.
     device : str, default="cpu"
         Torch device used by the module.
     """
