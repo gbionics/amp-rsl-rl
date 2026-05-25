@@ -390,7 +390,7 @@ class AMPLoader:
         *,
         obs: Optional[torch.Tensor],
         obs_type: Optional[Any] = None,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Optional[torch.Tensor]:
         if self.symmetry_cfg is None:
             return obs
 
