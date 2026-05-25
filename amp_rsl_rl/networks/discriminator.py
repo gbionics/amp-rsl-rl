@@ -3,7 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import inspect
 from typing import Any, Dict, Optional
 
 import torch
