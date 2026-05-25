@@ -17,7 +17,11 @@ from pathlib import Path
 from tensordict import TensorDict
 
 
-from amp_rsl_rl.utils.motion_loader import _call_augmentation_func, AMPLoader, VelocityRepresentation
+from amp_rsl_rl.utils.motion_loader import (
+    _call_augmentation_func,
+    AMPLoader,
+    VelocityRepresentation,
+)
 from amp_rsl_rl.networks import Discriminator
 
 # ── Test devices ─────────────────────────────────────────────────────────────
@@ -588,7 +592,9 @@ class TestDiscriminatorSymmetryIntegration:
 def _make_fake_dataset(num_frames=50, num_joints=6):
     """Create a fake motion dataset dict matching AMPLoader's expected .npy format."""
     joint_names = [f"joint_{i}" for i in range(num_joints)]
-    joint_positions = [np.random.randn(num_joints).astype(np.float32) for _ in range(num_frames)]
+    joint_positions = [
+        np.random.randn(num_joints).astype(np.float32) for _ in range(num_frames)
+    ]
     # Random 3D root positions
     root_position = [np.random.randn(3).astype(np.float32) for _ in range(num_frames)]
     # Random quaternions (xyzw), normalized
@@ -680,7 +686,9 @@ class TestAMPLoaderSymmetry:
         )
         # Augmented loader should have double the observations
         assert loader_sym.all_obs.shape[0] == 2 * loader_no_sym.all_obs.shape[0]
-        assert loader_sym.all_next_obs.shape[0] == 2 * loader_no_sym.all_next_obs.shape[0]
+        assert (
+            loader_sym.all_next_obs.shape[0] == 2 * loader_no_sym.all_next_obs.shape[0]
+        )
 
     def test_loader_symmetry_does_not_augment_reset_states(self, fake_dataset_dir):
         """Reset states should NOT be augmented (only AMP obs are)."""
@@ -730,7 +738,9 @@ class TestAMPLoaderSymmetry:
         n_orig = loader_no_sym.all_obs.shape[0]
         # First half of augmented buffer = original obs
         assert torch.allclose(loader_sym.all_obs[:n_orig], loader_no_sym.all_obs)
-        assert torch.allclose(loader_sym.all_next_obs[:n_orig], loader_no_sym.all_next_obs)
+        assert torch.allclose(
+            loader_sym.all_next_obs[:n_orig], loader_no_sym.all_next_obs
+        )
 
     def test_loader_augmented_second_half_is_mirrored(self, fake_dataset_dir):
         """The second half should be the mirrored (negated in our mock) observations."""
@@ -757,7 +767,9 @@ class TestAMPLoaderSymmetry:
         # Second half = negated (our mock mirror)
         assert torch.allclose(loader_sym.all_obs[n_orig:], -loader_no_sym.all_obs)
 
-    def test_loader_feed_forward_generator_yields_correct_shapes(self, fake_dataset_dir):
+    def test_loader_feed_forward_generator_yields_correct_shapes(
+        self, fake_dataset_dir
+    ):
         """feed_forward_generator should yield batches from the (possibly augmented) buffer."""
         cfg = {
             "use_amp_dataset_augmentation": True,
@@ -772,7 +784,9 @@ class TestAMPLoaderSymmetry:
             symmetry_cfg=cfg,
         )
         mini_batch_size = 16
-        gen = loader.feed_forward_generator(num_mini_batch=3, mini_batch_size=mini_batch_size)
+        gen = loader.feed_forward_generator(
+            num_mini_batch=3, mini_batch_size=mini_batch_size
+        )
         for state, next_state in gen:
             assert state.shape[0] == mini_batch_size
             assert next_state.shape[0] == mini_batch_size
@@ -862,8 +876,12 @@ class TestAMPLoaderSymmetry:
             slow_down_factor=1,
             symmetry_cfg=cfg,
         )
-        assert torch.allclose(loader.per_frame_weights.sum(), torch.tensor(1.0), atol=1e-5)
-        assert torch.allclose(loader.per_frame_weights_reset.sum(), torch.tensor(1.0), atol=1e-5)
+        assert torch.allclose(
+            loader.per_frame_weights.sum(), torch.tensor(1.0), atol=1e-5
+        )
+        assert torch.allclose(
+            loader.per_frame_weights_reset.sum(), torch.tensor(1.0), atol=1e-5
+        )
 
     def test_loader_per_frame_weights_length_matches_obs(self, fake_dataset_dir):
         """Per-frame weights should have same length as all_obs."""
