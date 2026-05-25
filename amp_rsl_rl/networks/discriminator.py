@@ -12,6 +12,7 @@ from torch import autograd
 from torch.nn import functional as F
 from rsl_rl.utils import utils
 from amp_rsl_rl.utils._compat import EmpiricalNormalization
+from amp_rsl_rl.utils.motion_loader import _call_augmentation_func
 
 
 class Discriminator(nn.Module):
@@ -51,7 +52,6 @@ class Discriminator(nn.Module):
         self.input_dim = input_dim
         self.reward_scale = reward_scale
         self.reward_clamp_epsilon = reward_clamp_epsilon
-        self.symmetry_cfg = symmetry_cfg
         layers = []
         curr_in_dim = input_dim
 
@@ -86,32 +86,34 @@ class Discriminator(nn.Module):
                 f"Unsupported loss type: {self.loss_type}. Supported types are 'BCEWithLogits' and 'Wasserstein'."
             )
 
-        if self.symmetry_cfg is not None:
-            fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
-            if isinstance(fn, str):
-                self.symmetry_cfg["amp_dataset_augmentation_func"] = (
-                    utils.string_to_callable(fn)
+        # ─── Check symmetry augmentation configuration ───
+        if symmetry_cfg is not None:
+            aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
+            if isinstance(aug_fn, str):
+                symmetry_cfg["amp_dataset_augmentation_func"] = (
+                    utils.string_to_callable(aug_fn)
                 )
+            aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
+            if aug_fn is not None and not callable(aug_fn):
+                raise ValueError(
+                    f"Discriminator symmetry augmentation function must be callable. Got: {aug_fn} of type {type(aug_fn)}"
+                )
+        self.symmetry_cfg = symmetry_cfg
+        # ─────────────────────────────────────────────────
 
     def apply_symmetry(
         self, tensor: torch.Tensor, obs_type: str = "amp"
     ) -> torch.Tensor:
-        if self.symmetry_cfg is None or self.symmetry_cfg.get(
-            "use_amp_dataset_augmentation", False
+        if self.symmetry_cfg is None or not getattr(
+            self.symmetry_cfg, "use_amp_dataset_augmentation", False
         ):
             return tensor
 
-        fn = self.symmetry_cfg.get("amp_dataset_augmentation_func")
+        fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
         if fn is None:
             return tensor
 
-        augmented, _ = utils.call_augmentation_func(
-            fn,
-            obs=tensor,
-            actions=None,
-            env=self.symmetry_cfg.get("_env"),
-            obs_type=obs_type,
-        )
+        augmented, _ = _call_augmentation_func(fn, obs=tensor, obs_type=obs_type)
 
         return augmented if augmented is not None else tensor
 

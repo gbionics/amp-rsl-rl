@@ -304,6 +304,7 @@ class AMPLoader:
                     f"{aug_fn}"
                 )
         self.symmetry_cfg = symmetry_cfg
+        # ─────────────────────────────────────────────────
 
         # ─── Parse dataset names and weights ───
         dataset_names = list(datasets.keys())
