@@ -278,7 +278,7 @@ class AMPLoader:
         simulation_dt: float,
         slow_down_factor: int,
         expected_joint_names: Union[List[str], None] = None,
-        symmetry_cfg: Optional[Dict[str, Any]] = None,
+        symmetry_cfg: Optional[Any] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
     ) -> None:
         self.device = device
