@@ -65,7 +65,9 @@ except PackageNotFoundError:
 RSL_RL_VERSION: tuple[int, int, int] = _parse_version(_rsl_rl_version_str)
 RSL_RL_MAJOR: int = RSL_RL_VERSION[0]
 RSL_RL_MINOR: int = RSL_RL_VERSION[1]
-RSL_RL_V3_3_PLUS: bool = RSL_RL_MAJOR >= 3 and RSL_RL_MINOR >= 3
+RSL_RL_V3_3_PLUS: bool = not (
+    RSL_RL_MAJOR < 3 or (RSL_RL_MAJOR == 3 and RSL_RL_MINOR < 3)
+)
 RSL_RL_V4_PLUS: bool = RSL_RL_MAJOR >= 4
 RSL_RL_V5_PLUS: bool = RSL_RL_MAJOR >= 5
 
