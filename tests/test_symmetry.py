@@ -11,10 +11,13 @@ Run with:
 
 import torch
 import pytest
+import numpy as np
+import tempfile
+from pathlib import Path
 from tensordict import TensorDict
 
 
-from amp_rsl_rl.utils.motion_loader import _call_augmentation_func
+from amp_rsl_rl.utils.motion_loader import _call_augmentation_func, AMPLoader, VelocityRepresentation
 from amp_rsl_rl.networks import Discriminator
 
 # ── Test devices ─────────────────────────────────────────────────────────────
@@ -577,3 +580,304 @@ class TestDiscriminatorSymmetryIntegration:
 
         # First half should give same results (without minibatch_std)
         assert torch.allclose(out_aug[:batch], out_orig, atol=1e-5)
+
+
+# ── Tests for AMPLoader symmetry augmentation ────────────────────────────────
+
+
+def _make_fake_dataset(num_frames=50, num_joints=6):
+    """Create a fake motion dataset dict matching AMPLoader's expected .npy format."""
+    joint_names = [f"joint_{i}" for i in range(num_joints)]
+    joint_positions = [np.random.randn(num_joints).astype(np.float32) for _ in range(num_frames)]
+    # Random 3D root positions
+    root_position = [np.random.randn(3).astype(np.float32) for _ in range(num_frames)]
+    # Random quaternions (xyzw), normalized
+    root_quaternion = []
+    for _ in range(num_frames):
+        q = np.random.randn(4).astype(np.float32)
+        q /= np.linalg.norm(q)
+        root_quaternion.append(q)
+
+    return {
+        "joints_list": joint_names,
+        "joint_positions": joint_positions,
+        "root_position": root_position,
+        "root_quaternion": root_quaternion,
+        "fps": 30.0,
+    }
+
+
+@pytest.fixture
+def fake_dataset_dir():
+    """Create a temporary directory with fake .npy motion datasets."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dataset = _make_fake_dataset(num_frames=50, num_joints=6)
+        np.save(Path(tmpdir) / "walk.npy", dataset)
+        dataset2 = _make_fake_dataset(num_frames=40, num_joints=6)
+        np.save(Path(tmpdir) / "run.npy", dataset2)
+        yield Path(tmpdir)
+
+
+class TestAMPLoaderSymmetry:
+    """Tests for AMPLoader symmetry augmentation."""
+
+    def test_loader_without_symmetry(self, fake_dataset_dir):
+        """AMPLoader works without symmetry_cfg."""
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        assert loader.all_obs.shape[0] == loader.all_next_obs.shape[0]
+        assert loader.symmetry_cfg is None
+
+    def test_loader_with_symmetry_disabled(self, fake_dataset_dir):
+        """AMPLoader with symmetry_cfg but augmentation disabled doesn't augment."""
+        cfg = {
+            "use_amp_dataset_augmentation": False,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym_disabled = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        # Same size since augmentation is disabled
+        assert loader_sym_disabled.all_obs.shape == loader_no_sym.all_obs.shape
+
+    def test_loader_with_symmetry_doubles_obs(self, fake_dataset_dir):
+        """AMPLoader with symmetry augmentation enabled should double the obs buffer."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        # Augmented loader should have double the observations
+        assert loader_sym.all_obs.shape[0] == 2 * loader_no_sym.all_obs.shape[0]
+        assert loader_sym.all_next_obs.shape[0] == 2 * loader_no_sym.all_next_obs.shape[0]
+
+    def test_loader_symmetry_does_not_augment_reset_states(self, fake_dataset_dir):
+        """Reset states should NOT be augmented (only AMP obs are)."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        # Reset states should have same size (not augmented)
+        assert loader_sym.all_states.shape == loader_no_sym.all_states.shape
+
+    def test_loader_augmented_obs_contains_originals(self, fake_dataset_dir):
+        """The first half of augmented obs should be the original observations."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        n_orig = loader_no_sym.all_obs.shape[0]
+        # First half of augmented buffer = original obs
+        assert torch.allclose(loader_sym.all_obs[:n_orig], loader_no_sym.all_obs)
+        assert torch.allclose(loader_sym.all_next_obs[:n_orig], loader_no_sym.all_next_obs)
+
+    def test_loader_augmented_second_half_is_mirrored(self, fake_dataset_dir):
+        """The second half should be the mirrored (negated in our mock) observations."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        n_orig = loader_no_sym.all_obs.shape[0]
+        # Second half = negated (our mock mirror)
+        assert torch.allclose(loader_sym.all_obs[n_orig:], -loader_no_sym.all_obs)
+
+    def test_loader_feed_forward_generator_yields_correct_shapes(self, fake_dataset_dir):
+        """feed_forward_generator should yield batches from the (possibly augmented) buffer."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        mini_batch_size = 16
+        gen = loader.feed_forward_generator(num_mini_batch=3, mini_batch_size=mini_batch_size)
+        for state, next_state in gen:
+            assert state.shape[0] == mini_batch_size
+            assert next_state.shape[0] == mini_batch_size
+            assert state.shape[1] == loader.all_obs.shape[1]
+
+    def test_loader_multiple_datasets_augmented(self, fake_dataset_dir):
+        """AMPLoader with multiple datasets augments all of them."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader_no_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 0.7, "run": 0.3},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        loader_sym = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 0.7, "run": 0.3},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        assert loader_sym.all_obs.shape[0] == 2 * loader_no_sym.all_obs.shape[0]
+
+    def test_loader_apply_symmetry_passthrough_when_no_cfg(self, fake_dataset_dir):
+        """AMPLoader._apply_symmetry returns obs unchanged when no symmetry_cfg."""
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+        )
+        x = torch.randn(10, 12)
+        out = loader._apply_symmetry(obs=x, obs_type="amp")
+        assert torch.equal(out, x)
+
+    def test_loader_apply_symmetry_none_func_passthrough(self, fake_dataset_dir):
+        """AMPLoader._apply_symmetry returns obs unchanged when func is None."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": None,
+        }
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        x = torch.randn(10, 12)
+        out = loader._apply_symmetry(obs=x, obs_type="amp")
+        assert torch.equal(out, x)
+
+    def test_loader_invalid_augmentation_func_raises(self, fake_dataset_dir):
+        """AMPLoader should raise if augmentation func is not callable."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": 12345,  # not callable, not a string
+        }
+        with pytest.raises(ValueError, match="not callable"):
+            AMPLoader(
+                device="cpu",
+                dataset_path_root=fake_dataset_dir,
+                datasets={"walk": 1.0},
+                simulation_dt=0.02,
+                slow_down_factor=1,
+                symmetry_cfg=cfg,
+            )
+
+    def test_loader_per_frame_weights_sum_to_one(self, fake_dataset_dir):
+        """Per-frame sampling weights should sum to 1 after augmentation."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 0.6, "run": 0.4},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        assert torch.allclose(loader.per_frame_weights.sum(), torch.tensor(1.0), atol=1e-5)
+        assert torch.allclose(loader.per_frame_weights_reset.sum(), torch.tensor(1.0), atol=1e-5)
+
+    def test_loader_per_frame_weights_length_matches_obs(self, fake_dataset_dir):
+        """Per-frame weights should have same length as all_obs."""
+        cfg = {
+            "use_amp_dataset_augmentation": True,
+            "amp_dataset_augmentation_func": _mirror_amp_dataset,
+        }
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=fake_dataset_dir,
+            datasets={"walk": 0.6, "run": 0.4},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            symmetry_cfg=cfg,
+        )
+        assert loader.per_frame_weights.shape[0] == loader.all_obs.shape[0]
+        assert loader.per_frame_weights_reset.shape[0] == loader.all_states.shape[0]
