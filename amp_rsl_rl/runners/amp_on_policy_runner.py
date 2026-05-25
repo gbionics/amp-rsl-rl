@@ -25,13 +25,19 @@ from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
 from amp_rsl_rl.utils import export_policy_as_onnx
-from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, store_code_state, resolve_obs_groups
+from amp_rsl_rl.utils._compat import (
+    RSL_RL_V4_PLUS,
+    store_code_state,
+    resolve_obs_groups,
+)
 
 if RSL_RL_V4_PLUS:
     from rsl_rl.models import MLPModel
+
     _v4_builtin_classes = {"MLPModel": MLPModel}
 else:
     from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+
     _v4_builtin_classes = {}
 
 # Built-in classes available for short-name resolution
@@ -196,11 +202,6 @@ class AMPOnPolicyRunner:
         self.env = env
         self.style_weight = train_cfg.get("style_weight", 0.5)
 
-        # if using symmetry then pass the environment config object
-        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
-            # this is used by the symmetry function for handling different observation terms
-            self.alg_cfg["symmetry_cfg"]["_env"] = env
-
         # Optional custom exporter function (set via set_export_policy_fn)
         self._export_policy_fn: Callable | None = None
 
@@ -220,10 +221,19 @@ class AMPOnPolicyRunner:
 
             # Filter config dicts to only contain kwargs accepted by the resolved class
             import inspect
-            actor_valid_keys = set(inspect.signature(actor_class.__init__).parameters.keys())
-            critic_valid_keys = set(inspect.signature(critic_class.__init__).parameters.keys())
-            self.actor_cfg = {k: v for k, v in self.actor_cfg.items() if k in actor_valid_keys}
-            self.critic_cfg = {k: v for k, v in self.critic_cfg.items() if k in critic_valid_keys}
+
+            actor_valid_keys = set(
+                inspect.signature(actor_class.__init__).parameters.keys()
+            )
+            critic_valid_keys = set(
+                inspect.signature(critic_class.__init__).parameters.keys()
+            )
+            self.actor_cfg = {
+                k: v for k, v in self.actor_cfg.items() if k in actor_valid_keys
+            }
+            self.critic_cfg = {
+                k: v for k, v in self.critic_cfg.items() if k in critic_valid_keys
+            }
 
             actor = actor_class(
                 observations,
@@ -301,7 +311,8 @@ class AMPOnPolicyRunner:
         )
 
         self.discriminator = Discriminator(
-            input_dim=num_amp_obs * 2,  # the discriminator takes in the concatenation of the current and next observation
+            input_dim=num_amp_obs
+            * 2,  # the discriminator takes in the concatenation of the current and next observation
             hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
             reward_scale=self.discriminator_cfg["reward_scale"],
             device=self.device,
@@ -463,7 +474,9 @@ class AMPOnPolicyRunner:
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    rewards = (1 - self.style_weight) * rewards + self.style_weight * style_rewards
+                    rewards = (
+                        1 - self.style_weight
+                    ) * rewards + self.style_weight * style_rewards
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)
@@ -762,7 +775,16 @@ class AMPOnPolicyRunner:
                     self.current_learning_iteration,
                 )
 
-    def load(self, path, load_optimizer=True, weights_only=False, load_cfg=None, strict=True, map_location=None, **kwargs):
+    def load(
+        self,
+        path,
+        load_optimizer=True,
+        weights_only=False,
+        load_cfg=None,
+        strict=True,
+        map_location=None,
+        **kwargs,
+    ):
         if load_cfg is None:
             load_cfg = {}
         do_load_optimizer = load_cfg.get("optimizer", load_optimizer)
