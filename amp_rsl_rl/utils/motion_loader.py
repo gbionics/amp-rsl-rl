@@ -8,7 +8,12 @@ import inspect
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Dict, Optional, Any
 from dataclasses import dataclass
-from rsl_rl.utils import utils
+from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS
+
+if RSL_RL_V3_3_PLUS:
+    from rsl_rl.utils import resolve_callable
+else:
+    from rsl_rl.utils import string_to_callable as resolve_callable
 
 import torch
 import numpy as np
@@ -290,9 +295,7 @@ class AMPLoader:
         if symmetry_cfg is not None:
             aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if isinstance(aug_fn, str):
-                symmetry_cfg["amp_dataset_augmentation_func"] = (
-                    utils.string_to_callable(aug_fn)
-                )
+                symmetry_cfg["amp_dataset_augmentation_func"] = resolve_callable(aug_fn)
             aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
                 raise ValueError(

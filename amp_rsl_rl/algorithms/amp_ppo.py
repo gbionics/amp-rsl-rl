@@ -14,13 +14,17 @@ import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
-from rsl_rl.utils import string_to_callable
 from rsl_rl.storage import RolloutStorage
 
 from amp_rsl_rl.storage import ReplayBuffer
 from amp_rsl_rl.networks import Discriminator
 from amp_rsl_rl.utils import AMPLoader, _call_augmentation_func
-from amp_rsl_rl.utils._compat import RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
+from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS, RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
+
+if RSL_RL_V3_3_PLUS:
+    from rsl_rl.utils import resolve_callable
+else:
+    from rsl_rl.utils import string_to_callable as resolve_callable
 
 
 class AMP_PPO:
@@ -201,7 +205,7 @@ class AMP_PPO:
                 )
             aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if isinstance(aug_fn, str):
-                symmetry_cfg["data_augmentation_func"] = string_to_callable(aug_fn)
+                symmetry_cfg["data_augmentation_func"] = resolve_callable(aug_fn)
             aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
                 raise ValueError(

@@ -23,6 +23,7 @@ symbols whose locations or signatures changed across major versions:
 Version flags exposed:
 - ``RSL_RL_VERSION``: full version tuple (major, minor, patch).
 - ``RSL_RL_MAJOR``: integer major version.
+- ``RSL_RL_V3_3_PLUS``: True if major == 3 and minor >= 3.
 - ``RSL_RL_V4_PLUS``: True if major >= 4.
 - ``RSL_RL_V5_PLUS``: True if major >= 5.
 """
@@ -35,10 +36,10 @@ import warnings
 from importlib.metadata import version, PackageNotFoundError
 from typing import List
 
-
 # ---------------------------------------------------------------------------
 # Version detection
 # ---------------------------------------------------------------------------
+
 
 def _parse_version(ver_str: str) -> tuple[int, int, int]:
     """Parse a PEP-440 version string into a (major, minor, patch) tuple."""
@@ -63,6 +64,8 @@ except PackageNotFoundError:
 
 RSL_RL_VERSION: tuple[int, int, int] = _parse_version(_rsl_rl_version_str)
 RSL_RL_MAJOR: int = RSL_RL_VERSION[0]
+RSL_RL_MINOR: int = RSL_RL_VERSION[1]
+RSL_RL_V3_3_PLUS: bool = RSL_RL_MAJOR >= 3 and RSL_RL_MINOR >= 3
 RSL_RL_V4_PLUS: bool = RSL_RL_MAJOR >= 4
 RSL_RL_V5_PLUS: bool = RSL_RL_MAJOR >= 5
 
@@ -85,7 +88,6 @@ except (ImportError, ModuleNotFoundError):
 
 from rsl_rl.utils import resolve_obs_groups  # noqa: F401
 
-
 # ---------------------------------------------------------------------------
 # store_code_state
 # ---------------------------------------------------------------------------
@@ -96,6 +98,7 @@ from rsl_rl.utils import resolve_obs_groups  # noqa: F401
 #
 # We provide a unified function with signature:
 #       store_code_state(log_dir: str, repos: list[str]) -> list[str]
+
 
 def _store_code_state_via_logger(log_dir: str, repos: List[str]) -> List[str]:
     """Reimplement store_code_state using the same logic as Logger._store_code_state.
@@ -161,6 +164,8 @@ except ImportError:
 __all__ = [
     "RSL_RL_VERSION",
     "RSL_RL_MAJOR",
+    "RSL_RL_MINOR",
+    "RSL_RL_V3_3_PLUS",
     "RSL_RL_V4_PLUS",
     "RSL_RL_V5_PLUS",
     "EmpiricalNormalization",
