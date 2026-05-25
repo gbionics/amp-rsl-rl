@@ -67,8 +67,8 @@ class AMP_PPO:
         Enables smooth ratio clipping instead of hard clamping.
     normalize_advantage_per_mini_batch : bool, default=False
         Whether to normalize advantages within each mini-batch (instead of the entire rollout).
-    symmetry_cfg : dict | None, default=None
-        Configuration dictionary enabling symmetry-based data augmentation and mirror loss.
+    symmetry_cfg : class | None, default=None
+        Configuration class enabling symmetry-based data augmentation and mirror loss.
     device : str, default="cpu"
         Torch device used by the module.
     """
@@ -186,20 +186,23 @@ class AMP_PPO:
         self.use_smooth_ratio_clipping: bool = use_smooth_ratio_clipping
 
         # Symmetry configuration for PPO and AMP augmentation
-        self.symmetry: Optional[Dict[str, Any]] = None
+        self.symmetry_cfg: Optional[Dict[str, Any]] = None
         if symmetry_cfg is not None:
-            use_symmetry = symmetry_cfg.get(
-                "use_data_augmentation", False
-            ) or symmetry_cfg.get("use_mirror_loss", False)
-            if not use_symmetry:
+            print("Symmetry configuration provided for AMP_PPO.")
+            use_data_augmentation = symmetry_cfg.get("use_data_augmentation", False)
+            use_mirror_loss = symmetry_cfg.get("use_mirror_loss", False)
+            if not use_data_augmentation:
                 print(
-                    "Symmetry configuration provided but neither data augmentation nor mirror loss are enabled."
-                    " Symmetry utilities will only be available for logging."
+                    "Data augmentation is not enabled. Symmetry utilities will only be available for logging."
                 )
-            aug_fn = symmetry_cfg.get("data_augmentation_func")
+            if not use_mirror_loss:
+                print(
+                    "Mirror loss is not enabled. Symmetry utilities will only be available for logging."
+                )
+            aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if isinstance(aug_fn, str):
                 symmetry_cfg["data_augmentation_func"] = string_to_callable(aug_fn)
-            aug_fn = symmetry_cfg.get("data_augmentation_func")
+            aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
                 raise ValueError(
                     "Symmetry configuration exists but the function is not callable: "
@@ -209,7 +212,7 @@ class AMP_PPO:
                 raise ValueError(
                     "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
                 )
-            self.symmetry = symmetry_cfg
+            self.symmetry_cfg = symmetry_cfg
 
     def init_storage(
         self,
@@ -273,19 +276,15 @@ class AMP_PPO:
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Apply configured symmetry augmentation to observations/actions."""
 
-        if self.symmetry is None:
+        if self.symmetry_cfg is None:
             return obs, actions
 
-        aug_fn = self.symmetry.get("data_augmentation_func")
+        aug_fn = self.symmetry_cfg.get("data_augmentation_func", None)
         if aug_fn is None:
             return obs, actions
 
         aug_obs, aug_actions = _call_augmentation_func(
-            aug_fn,
-            obs=obs,
-            actions=actions,
-            env=self.symmetry.get("_env"),
-            obs_type=obs_type,
+            aug_fn, obs=obs, actions=actions, obs_type=obs_type
         )
 
         return (
@@ -582,7 +581,9 @@ class AMP_PPO:
                     )
 
             # Symmetry data augmentation for PPO inputs
-            if self.symmetry and self.symmetry.get("use_data_augmentation", False):
+            if self.symmetry_cfg and self.symmetry_cfg.get(
+                "use_data_augmentation", False
+            ):
                 aug_obs, aug_actions = self._apply_symmetry(
                     obs=obs_batch,
                     actions=actions_batch,
@@ -703,8 +704,8 @@ class AMP_PPO:
 
             # Mirror loss (if enabled)
             symmetry_loss_value = torch.zeros(1, device=self.device)
-            if self.symmetry:
-                if not self.symmetry.get("use_data_augmentation", False):
+            if self.symmetry_cfg:
+                if not self.symmetry_cfg.get("use_data_augmentation", False):
                     sym_obs_batch, _ = self._apply_symmetry(
                         obs=obs_batch[:original_batch_size],
                         actions=None,
@@ -732,8 +733,8 @@ class AMP_PPO:
                         mean_actions_batch[original_batch_size:],
                         sym_actions.detach()[original_batch_size:],
                     )
-                    if self.symmetry.get("use_mirror_loss", False):
-                        coeff = self.symmetry.get("mirror_loss_coeff", 0.0)
+                    if self.symmetry_cfg.get("use_mirror_loss", False):
+                        coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
                         ppo_loss = ppo_loss + coeff * symmetry_loss_value
                     else:
                         symmetry_loss_value = symmetry_loss_value.detach()
@@ -742,7 +743,9 @@ class AMP_PPO:
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
 
-            if self.symmetry and self.symmetry.get("use_data_augmentation", False):
+            if self.symmetry_cfg and self.symmetry_cfg.get(
+                "use_data_augmentation", False
+            ):
                 policy_state = self.discriminator.apply_symmetry(
                     policy_state, obs_type="amp"
                 )
