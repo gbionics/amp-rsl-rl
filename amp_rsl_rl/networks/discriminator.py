@@ -105,13 +105,15 @@ class Discriminator(nn.Module):
         self, tensor: torch.Tensor, obs_type: str = "amp"
     ) -> torch.Tensor:
         if self.symmetry_cfg is None or not self.symmetry_cfg.get(
-            "use_amp_dataset_augmentation", False
+            "use_data_augmentation", False
         ):
             return tensor
 
         fn = self.symmetry_cfg.get("amp_dataset_augmentation_func", None)
         if fn is None:
-            return tensor
+            raise ValueError(
+                "Symmetry configuration specifies use_data_augmentation=True but no amp_dataset_augmentation_func provided for the discriminator."
+            )
 
         augmented, _ = _call_augmentation_func(fn, obs=tensor, obs_type=obs_type)
 
