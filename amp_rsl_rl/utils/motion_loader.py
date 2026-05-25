@@ -278,7 +278,7 @@ class AMPLoader:
         simulation_dt: float,
         slow_down_factor: int,
         expected_joint_names: Union[List[str], None] = None,
-        symmetry_cfg: Optional[Any] = None,
+        symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
     ) -> None:
         self.device = device
@@ -288,16 +288,12 @@ class AMPLoader:
 
         # ─── Check symmetry augmentation configuration ───
         if symmetry_cfg is not None:
-            # In AMPLoader the symmetry_cfg is expected to be a class
-            aug_fn = getattr(symmetry_cfg, "amp_dataset_augmentation_func", None)
+            aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if isinstance(aug_fn, str):
-                print(
-                    f"Converting symmetry_cfg.amp_dataset_augmentation_func from string to callable: {aug_fn}"
+                symmetry_cfg["amp_dataset_augmentation_func"] = (
+                    utils.string_to_callable(aug_fn)
                 )
-                symmetry_cfg.amp_dataset_augmentation_func = utils.string_to_callable(
-                    aug_fn
-                )
-            aug_fn = getattr(symmetry_cfg, "amp_dataset_augmentation_func", None)
+            aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
                 raise ValueError(
                     "Symmetry configuration exists but the function is not callable: "
@@ -351,8 +347,8 @@ class AMPLoader:
             next_idx = torch.clamp(idx + 1, max=T - 1)
             next_obs = data.get_amp_dataset_obs(next_idx, self.velocity_representation)
 
-            if self.symmetry_cfg and getattr(
-                self.symmetry_cfg, "use_amp_dataset_augmentation", False
+            if self.symmetry_cfg and self.symmetry_cfg.get(
+                "use_amp_dataset_augmentation", False
             ):
                 obs = self._apply_symmetry(obs=obs, obs_type="amp")
                 next_obs = self._apply_symmetry(obs=next_obs, obs_type="amp")
@@ -398,7 +394,7 @@ class AMPLoader:
         if self.symmetry_cfg is None:
             return obs
 
-        aug_fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
+        aug_fn = self.symmetry_cfg.get("amp_dataset_augmentation_func", None)
         if aug_fn is None:
             return obs
 
