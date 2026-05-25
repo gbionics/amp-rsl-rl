@@ -104,12 +104,12 @@ class Discriminator(nn.Module):
     def apply_symmetry(
         self, tensor: torch.Tensor, obs_type: str = "amp"
     ) -> torch.Tensor:
-        if self.symmetry_cfg is None or not getattr(
-            self.symmetry_cfg, "use_amp_dataset_augmentation", False
+        if self.symmetry_cfg is None or not self.symmetry_cfg.get(
+            "use_amp_dataset_augmentation", False
         ):
             return tensor
 
-        fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
+        fn = self.symmetry_cfg.get("amp_dataset_augmentation_func", None)
         if fn is None:
             return tensor
 
