@@ -79,7 +79,6 @@ def _call_augmentation_func(
     *,
     obs: Optional[torch.Tensor] = None,
     actions: Optional[torch.Tensor] = None,
-    env: Any = None,
     obs_type: Any = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     parameters = inspect.signature(fn).parameters
@@ -91,12 +90,6 @@ def _call_augmentation_func(
     if "actions" in parameters:
         kwargs["actions"] = actions
 
-    if "env" in parameters:
-        kwargs["env"] = env
-
-    if "cfg" in parameters and env is not None:
-        kwargs["cfg"] = getattr(env, "cfg", env)
-
     if "obs_type" in parameters and obs_type is not None:
         kwargs["obs_type"] = obs_type
 
@@ -105,6 +98,7 @@ def _call_augmentation_func(
     if isinstance(result, tuple):
         return result
 
+    # Returning a tuple for consistency: (aug_obs, aug_actions)
     return result, None
 
 
@@ -291,13 +285,25 @@ class AMPLoader:
         self.velocity_representation = velocity_representation
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
-        self.symmetry_cfg = symmetry_cfg
-        if self.symmetry_cfg is not None:
-            fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
-            if isinstance(fn, str):
-                self.symmetry_cfg.amp_dataset_augmentation_func = (
-                    utils.string_to_callable(fn)
+
+        # ─── Check symmetry augmentation configuration ───
+        if symmetry_cfg is not None:
+            # In AMPLoader the symmetry_cfg is expected to be a class
+            aug_fn = getattr(symmetry_cfg, "amp_dataset_augmentation_func", None)
+            if isinstance(aug_fn, str):
+                print(
+                    f"Converting symmetry_cfg.amp_dataset_augmentation_func from string to callable: {aug_fn}"
                 )
+                symmetry_cfg.amp_dataset_augmentation_func = utils.string_to_callable(
+                    aug_fn
+                )
+            aug_fn = getattr(symmetry_cfg, "amp_dataset_augmentation_func", None)
+            if aug_fn is not None and not callable(aug_fn):
+                raise ValueError(
+                    "Symmetry configuration exists but the function is not callable: "
+                    f"{aug_fn}"
+                )
+        self.symmetry_cfg = symmetry_cfg
 
         # ─── Parse dataset names and weights ───
         dataset_names = list(datasets.keys())
@@ -347,8 +353,8 @@ class AMPLoader:
             if self.symmetry_cfg and getattr(
                 self.symmetry_cfg, "use_amp_dataset_augmentation", False
             ):
-                obs = self._apply_symmetry(obs, obs_type="amp")
-                next_obs = self._apply_symmetry(next_obs, obs_type="amp")
+                obs = self._apply_symmetry(obs=obs, obs_type="amp")
+                next_obs = self._apply_symmetry(obs=next_obs, obs_type="amp")
 
             obs_list.append(obs)
             next_obs_list.append(next_obs)
@@ -386,28 +392,18 @@ class AMPLoader:
         self,
         *,
         obs: Optional[torch.Tensor],
-        actions: Optional[torch.Tensor],
         obs_type: Optional[Any] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.symmetry is None:
-            return obs, actions
+        if self.symmetry_cfg is None:
+            return obs
 
-        aug_fn = self.symmetry.get("data_augmentation_func")
+        aug_fn = getattr(self.symmetry_cfg, "amp_dataset_augmentation_func", None)
         if aug_fn is None:
-            return obs, actions
+            return obs
 
-        aug_obs, aug_actions = _call_augmentation_func(
-            aug_fn,
-            obs=obs,
-            actions=actions,
-            env=self.symmetry.get("_env"),
-            obs_type=obs_type,
-        )
+        aug_obs, _ = _call_augmentation_func(aug_fn, obs=obs, obs_type=obs_type)
 
-        return (
-            aug_obs if aug_obs is not None else obs,
-            aug_actions if aug_actions is not None else actions,
-        )
+        return aug_obs if aug_obs is not None else obs
 
     def _resample_data_Rn(
         self,
