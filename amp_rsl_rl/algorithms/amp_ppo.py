@@ -720,9 +720,14 @@ class AMP_PPO:
                 if sym_obs_batch is not None:
                     with torch.no_grad():
                         sym_obs_detached = sym_obs_batch.detach().clone()
-                    mean_actions_batch = self.actor_critic.act_inference(
-                        sym_obs_detached
-                    )
+                    if RSL_RL_V4_PLUS:
+                        mean_actions_batch = self.actor(
+                            sym_obs_detached, stochastic_output=False
+                        )
+                    else:
+                        mean_actions_batch = self.actor_critic.act_inference(
+                            sym_obs_detached
+                        )
                     action_mean_orig = mean_actions_batch[:original_batch_size]
                     _, sym_actions = self._apply_symmetry(
                         obs=None,
