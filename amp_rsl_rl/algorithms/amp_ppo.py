@@ -191,7 +191,6 @@ class AMP_PPO:
         # Symmetry configuration for PPO and AMP augmentation
         self.symmetry_cfg: Optional[Dict[str, Any]] = None
         if symmetry_cfg is not None:
-            print("Symmetry configuration provided for AMP_PPO.")
             use_data_augmentation = symmetry_cfg.get("use_data_augmentation", False)
             use_mirror_loss = symmetry_cfg.get("use_mirror_loss", False)
             if not use_data_augmentation:
