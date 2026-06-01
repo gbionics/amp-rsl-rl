@@ -308,6 +308,9 @@ class AMPOnPolicyRunner:
             expected_joint_names=amp_joint_names,
             velocity_representation=velocity_representation,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            amp_obs_components=self.dataset_cfg.get("amp_obs_components"),
+            body_links_names=self.dataset_cfg.get("body_links_names"),
+            anchor_body_name=self.dataset_cfg.get("anchor_body_name"),
         )
 
         self.discriminator = Discriminator(
