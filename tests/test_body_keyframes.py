@@ -1,6 +1,4 @@
-# Copyright (c) 2025, Istituto Italiano di Tecnologia
-# All rights reserved.
-#
+# SPDX-FileCopyrightText: Generative Bionics S.R.L.
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Tests for body keyframe observations in AMPLoader.
