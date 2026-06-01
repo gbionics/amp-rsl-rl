@@ -64,22 +64,53 @@ amp_rsl_rl/
 
 ## 📁 Dataset Structure
 
-The AMP-RSL-RL framework expects motion capture datasets in `.npy` format. Each `.npy` file must contain a Python dictionary with the following keys:
+AMP-RSL-RL expects each motion file to be a `.npy` containing a Python dictionary.
+
+### Required keys (always used)
 
 - **`joints_list`**: `List[str]`  
-  A list of joint names. These should correspond to the joint order expected by the agent.
+  Joint names in the same order expected by the robot configuration.
 
-- **`joint_positions`**: `List[np.ndarray]`  
-  A list where each element is a NumPy array representing the joint positions at a frame. All arrays should have the same shape `(N,)`, where `N` is the number of joints.
+- **`joint_positions`**: array-like, shape `(T, N_joints)`  
+  Joint positions over time.
 
-- **`root_position`**: `List[np.ndarray]`  
-  A list of 3D vectors representing the position of the base (root) of the agent in world coordinates for each frame.
+- **`root_position`**: array-like, shape `(T, 3)`  
+  Base position in world frame.
 
-- **`root_quaternion`**: `List[np.ndarray]`  
-  A list of unit quaternions in **`xyzw`** format (SciPy convention), representing the base orientation of the agent for each frame.
+- **`root_quaternion`**: array-like, shape `(T, 4)`  
+  Base orientation in quaternion **`xyzw`** format (SciPy convention).
 
-- **`fps`**: `float`  
-  The number of frames per second in the original dataset. This is used to resample the data to match the simulator's timestep.
+- **`fps`**: `float` (or scalar array)  
+  Original dataset framerate. The loader resamples to simulator `dt`.
+
+### Optional keys (needed for body keyframe observations)
+
+These keys are required only if you enable any of:
+`body_pos_b`, `body_ori_b`, `body_lin_vel_b`, `body_ang_vel_b` in `amp_obs_components`.
+
+- **`body_links_list`**: `List[str]`  
+  Names of links for which body keyframes are provided.
+
+- **`body_links_pos_w`**: array-like, shape `(T, N_bodies, 3)`  
+  Body positions in world frame.
+
+- **`body_links_quat_w`**: array-like, shape `(T, N_bodies, 4)`  
+  Body orientations in world frame, quaternion **`xyzw`** format.
+
+### Configuration fields for body keyframes
+
+When using body keyframe components, set these in `dataset_cfg`:
+
+- **`amp_obs_components`**: ordered list of discriminator components to concatenate.
+- **`body_links_names`**: ordered list of body names to use from the dataset.
+- **`anchor_body_name`**: reference body used to express relative body observations.
+
+Notes:
+
+- `anchor_body_name` must be present in `body_links_names`.
+- The anchor body is excluded from the final body observation vectors.
+- For backward compatibility, if `amp_obs_components` is not provided, the default is
+  `["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"]`.
 
 ---
 
@@ -100,19 +131,44 @@ training remain consistent with their symmetric counterparts.
 
 ### Example
 
-Here’s an example of how the structure might look when loaded in Python:
+Example dataset dictionary with optional body keyframes:
 
 ```python
 {
     "joints_list": ["hip", "knee", "ankle"],
-    "joint_positions": [np.array([0.1, -0.2, 0.3]), np.array([0.11, -0.21, 0.31]), ...],
-    "root_position": [np.array([0.0, 0.0, 1.0]), np.array([0.01, 0.0, 1.0]), ...],
-    "root_quaternion": [np.array([0.0, 0.0, 0.0, 1.0]), np.array([0.0, 0.0, 0.1, 0.99]), ...],
-    "fps": 120.0
+    "joint_positions": np.ndarray(shape=(T, 3)),
+    "root_position": np.ndarray(shape=(T, 3)),
+    "root_quaternion": np.ndarray(shape=(T, 4)),  # xyzw
+    "fps": 120.0,
+
+    # Optional: required only for body_* discriminator components
+    "body_links_list": ["root_link", "left_knee", "right_knee"],
+    "body_links_pos_w": np.ndarray(shape=(T, 3, 3)),
+    "body_links_quat_w": np.ndarray(shape=(T, 3, 4)),  # xyzw
 }
 ```
 
-All lists must have the same number of entries (i.e. one per frame). The dataset should represent smooth motion captured over time.
+`T` is the number of frames. All time-dependent fields must share the same `T`.
+
+Example `dataset_cfg` enabling body keyframe observations:
+
+```python
+dataset_cfg = {
+    "amp_data_path": "/path/to/datasets",
+    "datasets": {"walk": 1.0},
+    "slow_down_factor": 1,
+    "amp_obs_components": [
+        "joint_pos",
+        "joint_vel",
+        "base_lin_vel",
+        "base_ang_vel",
+        "body_pos_b",
+        "body_ori_b",
+    ],
+    "body_links_names": ["root_link", "left_knee", "right_knee"],
+    "anchor_body_name": "root_link",
+}
+```
 
 ---
 
