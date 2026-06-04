@@ -484,7 +484,11 @@ class AMPLoader:
                     arr[i] = frame[src_idx]
             jp_list.append(arr)
 
-        dt = 1.0 / data["fps"] / float(slow_down_factor)
+        if isinstance(data["fps"], np.ndarray):
+            fps = float(data["fps"].reshape(-1)[0])
+        else:
+            fps = float(data["fps"])
+        dt = 1.0 / fps / float(slow_down_factor)
         T = len(jp_list)
         t_orig = np.linspace(0, T * dt, T)
         T_new = int(T * dt / simulation_dt)
