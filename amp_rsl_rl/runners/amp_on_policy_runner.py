@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import importlib
 import os
-import statistics
 import time
 import warnings
-from collections import deque
 from typing import Callable
 
 import torch
@@ -373,8 +371,13 @@ class AMPOnPolicyRunner:
 
     @staticmethod
     def _flatten_amp_obs(amp_obs) -> torch.Tensor:
+        """Flatten AMP observations into a contiguous 2D tensor.
+
+        This method guarantees tensor outputs are contiguous so call sites do not
+        need an additional ``clone()`` to force fresh storage.
+        """
         if isinstance(amp_obs, torch.Tensor):
-            return amp_obs
+            return amp_obs.contiguous()
         if isinstance(amp_obs, dict):
             if "joint_pos" in amp_obs and "joint_vel" in amp_obs:
                 return torch.cat([amp_obs["joint_pos"], amp_obs["joint_vel"]], dim=-1)
@@ -388,6 +391,11 @@ class AMPOnPolicyRunner:
         raise TypeError(f"Unsupported AMP observation type: {type(amp_obs)}")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+        """Run training iterations while minimizing rollout-time synchronization.
+
+        Episode reward/length tracking is kept on GPU and synchronized only in
+        the periodic logging step.
+        """
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -433,12 +441,15 @@ class AMPOnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs = self.env.get_observations().to(self.device)
-        amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+        amp_obs = self._flatten_amp_obs(obs["amp"])
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
+        max_tracking_size = 100
+        rewbuffer = torch.zeros(max_tracking_size, dtype=torch.float, device=self.device)
+        lenbuffer = torch.zeros(max_tracking_size, dtype=torch.float, device=self.device)
+        rewbuffer_ptr = 0
+        rewbuffer_count = 0
         cur_reward_sum = torch.zeros(
             self.env.num_envs, dtype=torch.float, device=self.device
         )
@@ -466,7 +477,7 @@ class AMPOnPolicyRunner:
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
 
-                    next_amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+                    next_amp_obs = self._flatten_amp_obs(obs["amp"])
                     style_rewards = self.discriminator.predict_reward(
                         amp_obs, next_amp_obs
                     )
@@ -493,10 +504,30 @@ class AMPOnPolicyRunner:
                         new_ids = torch.nonzero(dones, as_tuple=False)
                         if new_ids.numel() > 0:
                             env_indices = new_ids.view(-1)
-                            rewbuffer.extend(cur_reward_sum[env_indices].cpu().tolist())
-                            lenbuffer.extend(
-                                cur_episode_length[env_indices].cpu().tolist()
-                            )
+                            done_rewards = cur_reward_sum[env_indices]
+                            done_lengths = cur_episode_length[env_indices]
+                            n_done = int(done_rewards.numel())
+                            if n_done >= max_tracking_size:
+                                rewbuffer.copy_(done_rewards[-max_tracking_size:])
+                                lenbuffer.copy_(done_lengths[-max_tracking_size:])
+                                rewbuffer_ptr = 0
+                                rewbuffer_count = max_tracking_size
+                            elif n_done > 0:
+                                first = min(n_done, max_tracking_size - rewbuffer_ptr)
+                                rewbuffer[rewbuffer_ptr : rewbuffer_ptr + first] = done_rewards[
+                                    :first
+                                ]
+                                lenbuffer[rewbuffer_ptr : rewbuffer_ptr + first] = done_lengths[
+                                    :first
+                                ]
+                                remaining = n_done - first
+                                if remaining > 0:
+                                    rewbuffer[:remaining] = done_rewards[first:]
+                                    lenbuffer[:remaining] = done_lengths[first:]
+                                rewbuffer_ptr = (rewbuffer_ptr + n_done) % max_tracking_size
+                                rewbuffer_count = min(
+                                    max_tracking_size, rewbuffer_count + n_done
+                                )
                             cur_reward_sum[env_indices] = 0
                             cur_episode_length[env_indices] = 0
 
@@ -547,6 +578,11 @@ class AMPOnPolicyRunner:
         )
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
+        """Log training metrics with single-pass episode aggregation.
+
+        Episode-info tensors are collected in Python lists and concatenated once
+        per key to avoid repeated reallocations.
+        """
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
@@ -554,16 +590,22 @@ class AMPOnPolicyRunner:
         ep_string = ""
         if locs["ep_infos"]:
             for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
+                parts = []
                 for ep_info in locs["ep_infos"]:
                     # handle scalar and zero dimensional tensor infos
                     if key not in ep_info:
                         continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                    t = ep_info[key]
+                    if not isinstance(t, torch.Tensor):
+                        t = torch.tensor([t], dtype=torch.float, device=self.device)
+                    else:
+                        t = t.to(self.device)
+                    if t.dim() == 0:
+                        t = t.unsqueeze(0)
+                    parts.append(t)
+                if not parts:
+                    continue
+                infotensor = torch.cat(parts)
                 value = torch.mean(infotensor)
                 # log to logger and terminal
                 if "/" in key:
@@ -623,13 +665,23 @@ class AMPOnPolicyRunner:
         if self.log_dir and self.logger_type in ("wandb", "mlflow"):
             self.writer.add_video_files(self.log_dir, step=locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
-        if len(locs["rewbuffer"]) > 0:
+        mean_rew = None
+        mean_len = None
+        if locs["rewbuffer_count"] > 0:
+            if locs["rewbuffer_count"] < locs["rewbuffer"].numel():
+                rew_values = locs["rewbuffer"][: locs["rewbuffer_count"]]
+                len_values = locs["lenbuffer"][: locs["rewbuffer_count"]]
+            else:
+                rew_values = locs["rewbuffer"]
+                len_values = locs["lenbuffer"]
+            mean_rew = rew_values.mean().item()
+            mean_len = len_values.mean().item()
             self.writer.add_scalar(
-                "Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"]
+                "Train/mean_reward", mean_rew, locs["it"]
             )
             self.writer.add_scalar(
                 "Train/mean_episode_length",
-                statistics.mean(locs["lenbuffer"]),
+                mean_len,
                 locs["it"],
             )
             self.writer.add_scalar(
@@ -644,18 +696,18 @@ class AMPOnPolicyRunner:
             ):  # wandb/mlflow do not support non-integer x-axis logging
                 self.writer.add_scalar(
                     "Train/mean_reward/time",
-                    statistics.mean(locs["rewbuffer"]),
+                    mean_rew,
                     self.tot_time,
                 )
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time",
-                    statistics.mean(locs["lenbuffer"]),
+                    mean_len,
                     self.tot_time,
                 )
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
-        if len(locs["rewbuffer"]) > 0:
+        if locs["rewbuffer_count"] > 0:
             log_string = (
                 f"""{'#' * width}\n"""
                 f"""{str.center(width, ' ')}\n\n"""
@@ -665,8 +717,8 @@ class AMPOnPolicyRunner:
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
-                f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
-                f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+                f"""{'Mean reward:':>{pad}} {mean_rew:.2f}\n"""
+                f"""{'Mean episode length:':>{pad}} {mean_len:.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")

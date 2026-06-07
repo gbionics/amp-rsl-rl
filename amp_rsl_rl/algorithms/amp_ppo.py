@@ -477,6 +477,11 @@ class AMP_PPO:
             (mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss,
              mean_policy_pred, mean_expert_pred, mean_accuracy_policy, mean_accuracy_expert,
              mean_kl_divergence, mean_symmetry_loss)
+
+        Notes
+        -----
+        This implementation avoids redundant AMP tensor clones and reuses the
+        discriminator trunk activations for gradient-penalty computation when possible.
         """
         # Initialize mean loss and accuracy statistics.
         mean_value_loss: float = 0.0
@@ -766,40 +771,43 @@ class AMP_PPO:
                     expert_next_state, obs_type="amp"
                 )
 
-            # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
-            policy_state = policy_state.to(self.device)
-            policy_next_state = policy_next_state.to(self.device)
-            expert_state = expert_state.to(self.device)
-            expert_next_state = expert_next_state.to(self.device)
+            # Keep non-blocking transfers in case data is produced on CPU.
+            policy_state = policy_state.to(self.device, non_blocking=True)
+            policy_next_state = policy_next_state.to(self.device, non_blocking=True)
+            expert_state = expert_state.to(self.device, non_blocking=True)
+            expert_next_state = expert_next_state.to(self.device, non_blocking=True)
 
-            # Keep raw tensors for normalizer updates
-            policy_state_raw = policy_state.detach().clone()
-            policy_next_state_raw = policy_next_state.detach().clone()
-            expert_state_raw = expert_state.detach().clone()
-            expert_next_state_raw = expert_next_state.detach().clone()
+            # Build expert inputs with gradients enabled so R1 penalty can reuse
+            # trunk activations from the same forward pass.
+            expert_state_gp = expert_state.detach().requires_grad_(True)
+            expert_next_state_gp = expert_next_state.detach().requires_grad_(True)
 
             # Concatenate policy and expert AMP observations for the discriminator input.
             B_pol = policy_state.size(0)
+            policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
+            expert_input = torch.cat([expert_state_gp, expert_next_state_gp], dim=-1)
             discriminator_input = torch.cat(
-                (
-                    torch.cat([policy_state, policy_next_state], dim=-1),
-                    torch.cat([expert_state, expert_next_state], dim=-1),
-                ),
+                (policy_input, expert_input),
                 dim=0,
             )
-            discriminator_output = self.discriminator(discriminator_input)
+            discriminator_output, discriminator_trunk = self.discriminator(
+                discriminator_input, return_trunk=True
+            )
             policy_d, expert_d = (
                 discriminator_output[:B_pol],
                 discriminator_output[B_pol:],
             )
+            expert_trunk = discriminator_trunk[B_pol:]
 
             # Compute discriminator losses
             amp_loss, grad_pen_loss = self.discriminator.compute_loss(
                 policy_d=policy_d,
                 expert_d=expert_d,
-                sample_amp_expert=(expert_state, expert_next_state),
+                sample_amp_expert=(expert_state_gp, expert_next_state_gp),
                 sample_amp_policy=(policy_state, policy_next_state),
                 lambda_=10,
+                expert_trunk_out=expert_trunk,
+                expert_input=expert_input,
             )
 
             # The final loss combines the PPO loss with AMP losses.
@@ -819,10 +827,10 @@ class AMP_PPO:
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
             self.discriminator.update_normalization(
-                expert_state_raw,
-                expert_next_state_raw,
-                policy_state_raw,
-                policy_next_state_raw,
+                policy_state.detach(),
+                policy_next_state.detach(),
+                expert_state.detach(),
+                expert_next_state.detach(),
             )
 
             # Compute probabilities from the discriminator logits.

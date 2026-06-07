@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 from amp_rsl_rl.utils._compat import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
@@ -37,16 +39,39 @@ class ActorMoE(nn.Module):
         gate_hidden_dims: list[int] | None = None,
         activation="elu",
     ):
+        """Build an MoE actor with a batched expert path for K>1.
+
+        The previous implementation evaluated each expert sequentially in Python.
+        This implementation stacks expert parameters and computes all experts in
+        parallel using batched tensor math, while keeping a single-expert fallback
+        path for compatibility.
+        """
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_experts = num_experts
         act = resolve_nn_activation(activation)
+        self.expert_activation = act
+        self.hidden_dims = list(hidden_dims)
 
         # experts
-        self.experts = nn.ModuleList(
-            [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
-        )
+        self.experts: nn.ModuleList | None = None
+        self.expert_weights: nn.ParameterList | None = None
+        self.expert_biases: nn.ParameterList | None = None
+        if num_experts == 1:
+            self.experts = nn.ModuleList([MLP_net(obs_dim, hidden_dims, act_dim, act)])
+        else:
+            dims = [obs_dim, *self.hidden_dims, act_dim]
+            self.expert_weights = nn.ParameterList()
+            self.expert_biases = nn.ParameterList()
+            for in_features, out_features in zip(dims[:-1], dims[1:]):
+                weight = nn.Parameter(
+                    torch.empty(num_experts, out_features, in_features)
+                )
+                bias = nn.Parameter(torch.empty(num_experts, out_features))
+                self._reset_batched_linear(weight, bias)
+                self.expert_weights.append(weight)
+                self.expert_biases.append(bias)
 
         # gating network
         gate_layers = []
@@ -59,14 +84,37 @@ class ActorMoE(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
         self.softmax = nn.Softmax(dim=-1)  # kept separate for ONNX clarity
 
+    @staticmethod
+    def _reset_batched_linear(weight: torch.Tensor, bias: torch.Tensor) -> None:
+        """Initialize stacked expert linear layers like ``nn.Linear`` defaults."""
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        fan_in = weight.shape[-1]
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+        nn.init.uniform_(bias, -bound, bound)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
+        """Compute the MoE action mean while preserving previous outputs.
+
         Args:
             x: [batch, obs_dim]
         Returns:
             mean action: [batch, act_dim]
         """
-        expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
+        if self.num_experts == 1 and self.experts is not None:
+            expert_out = self.experts[0](x).unsqueeze(-1)
+        else:
+            assert self.expert_weights is not None
+            assert self.expert_biases is not None
+            x_exp = x.unsqueeze(1).expand(-1, self.num_experts, -1)
+            h = x_exp
+            for layer_idx, (weight, bias) in enumerate(
+                zip(self.expert_weights, self.expert_biases)
+            ):
+                h = torch.einsum("bki,koi->bko", h, weight) + bias.unsqueeze(0)
+                if layer_idx < len(self.expert_weights) - 1:
+                    h = self.expert_activation(h)
+            expert_out = h.transpose(1, 2)
+
         gate_logits = self.gate(x)  # [batch, K]
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
         return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]

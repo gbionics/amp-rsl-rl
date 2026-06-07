@@ -121,14 +121,19 @@ class Discriminator(nn.Module):
 
         return augmented if augmented is not None else tensor
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_trunk: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the discriminator.
 
         Args:
             x (Tensor): Input tensor (batch_size, input_dim).
+            return_trunk (bool): If True, also return trunk features before
+                minibatch-std concatenation so callers can reuse them.
 
         Returns:
-            Tensor: Discriminator output logits/scores.
+            Tensor or tuple[Tensor, Tensor]: Discriminator logits, and optionally
+                trunk features.
         """
 
         # Normalize AMP observations. If not enabled the normalizer is identity.
@@ -138,11 +143,15 @@ class Discriminator(nn.Module):
         next_state = self.amp_normalizer(next_state)
         x = torch.cat([state, next_state], dim=-1)
 
-        h = self.trunk(x)
+        trunk_out = self.trunk(x)
+        h = trunk_out
         if self.use_minibatch_std:
             s = self._minibatch_std_scalar(h)
             h = torch.cat([h, s], dim=-1)
-        return self.linear(h)
+        logits = self.linear(h)
+        if return_trunk:
+            return logits, trunk_out
+        return logits
 
     def _minibatch_std_scalar(self, h: torch.Tensor) -> torch.Tensor:
         """Mean over feature-wise std across the batch; shape (B,1)."""
@@ -229,7 +238,14 @@ class Discriminator(nn.Module):
         sample_amp_expert,
         sample_amp_policy,
         lambda_: float = 10,
+        expert_trunk_out: torch.Tensor | None = None,
+        expert_input: torch.Tensor | None = None,
     ):
+        """Compute discriminator loss and gradient penalty.
+
+        ``expert_trunk_out`` can be passed from a previous forward pass to avoid
+        a redundant trunk evaluation during BCE gradient-penalty computation.
+        """
 
         # Compute gradient penalty to stabilize discriminator training.
         sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
@@ -238,6 +254,8 @@ class Discriminator(nn.Module):
             expert_states=sample_amp_expert,
             policy_states=sample_amp_policy,
             lambda_=lambda_,
+            trunk_out=expert_trunk_out,
+            expert_input=expert_input,
         )
         if self.loss_type == "BCEWithLogits":
             expert_loss = self.loss_fun(expert_d, torch.ones_like(expert_d))
@@ -253,6 +271,8 @@ class Discriminator(nn.Module):
         expert_states: tuple[torch.Tensor, torch.Tensor],
         policy_states: tuple[torch.Tensor, torch.Tensor],
         lambda_: float = 10,
+        trunk_out: torch.Tensor | None = None,
+        expert_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Computes the gradient penalty used to regularize the discriminator.
 
@@ -260,6 +280,11 @@ class Discriminator(nn.Module):
             expert_states (tuple[Tensor, Tensor]): A tuple containing batches of expert states and expert next states.
             policy_states (tuple[Tensor, Tensor]): A tuple containing batches of policy states and policy next states.
             lambda_ (float): Penalty coefficient.
+            trunk_out (Tensor | None): Optional precomputed trunk output for expert
+                data. If provided and connected to ``expert_states`` graph, reuses
+                it to avoid an extra trunk forward pass.
+            expert_input (Tensor | None): Optional concatenated expert input tensor
+                used to produce ``trunk_out`` in a previous forward pass.
 
         Returns:
             Tensor: Gradient penalty value.
@@ -289,10 +314,14 @@ class Discriminator(nn.Module):
             return lambda_ * (grad.norm(2, dim=1) - 1.0).pow(2).mean()
         elif self.loss_type == "BCEWithLogits":
             # R1 regularizer on REAL: 0.5 * lambda * ||∇_x D(x_real)||^2
-            data = expert.detach().requires_grad_(True)
-            # Compute D(x_real) with minibatch-std DETACHED,
-            # so gradients are w.r.t. the sample itself, not the batch statistics.
-            h = self.trunk(data)
+            data = expert_input if expert_input is not None else expert
+            if trunk_out is None or not data.requires_grad:
+                data = expert.detach().requires_grad_(True)
+                # Compute D(x_real) with minibatch-std DETACHED,
+                # so gradients are w.r.t. the sample itself, not the batch statistics.
+                h = self.trunk(data)
+            else:
+                h = trunk_out
             if self.use_minibatch_std:
                 with torch.no_grad():
                     s = self._minibatch_std_scalar(h)

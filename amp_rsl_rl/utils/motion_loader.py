@@ -286,6 +286,11 @@ class AMPLoader:
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
     ) -> None:
+        """Initialize AMP datasets and precompute sampling tensors on a target device.
+
+        A device consistency assertion is added so mismatched construction fails
+        fast instead of causing implicit transfers in training hot paths.
+        """
         self.device = device
         self.velocity_representation = velocity_representation
         if isinstance(dataset_path_root, str):
@@ -387,6 +392,10 @@ class AMPLoader:
             ]
         )
         self.per_frame_weights_reset = per_frame_reset / per_frame_reset.sum()
+        expected_device_type = str(device).split(":")[0]
+        assert self.all_obs.device.type == expected_device_type, (
+            f"AMPLoader tensors are on {self.all_obs.device}, expected {device}"
+        )
 
     def _apply_symmetry(
         self,
@@ -461,6 +470,9 @@ class AMPLoader:
         """
         Loads and processes one motion dataset.
 
+        Joint reordering and frame transforms are vectorized to avoid per-frame
+        Python loops while preserving numerical equivalence.
+
         Returns:
             MotionData instance
         """
@@ -475,14 +487,13 @@ class AMPLoader:
             else:
                 idx_map.append(None)
 
-        # reorder & fill joint positions
-        jp_list: List[np.ndarray] = []
-        for frame in data["joint_positions"]:
-            arr = np.zeros((len(idx_map),), dtype=frame.dtype)
-            for i, src_idx in enumerate(idx_map):
-                if src_idx is not None:
-                    arr[i] = frame[src_idx]
-            jp_list.append(arr)
+        # Reorder joint positions with vectorized advanced indexing.
+        jp_array = np.asarray(data["joint_positions"])
+        jp_list = np.zeros((jp_array.shape[0], len(idx_map)), dtype=jp_array.dtype)
+        valid = [(dst, src) for dst, src in enumerate(idx_map) if src is not None]
+        if valid:
+            dst_cols, src_cols = map(list, zip(*valid))
+            jp_list[:, dst_cols] = jp_array[:, src_cols]
 
         if isinstance(data["fps"], np.ndarray):
             fps = float(data["fps"].reshape(-1)[0])
@@ -514,13 +525,10 @@ class AMPLoader:
             resampled_base_orientations, simulation_dt, local=False
         )
 
-        resampled_base_lin_vel_local = np.stack(
-            [
-                R.as_matrix().T @ v
-                for R, v in zip(
-                    resampled_base_orientations, resampled_base_lin_vel_mixed
-                )
-            ]
+        # Vectorized local linear velocity: R^T @ v for all frames.
+        R_mats = resampled_base_orientations.as_matrix()
+        resampled_base_lin_vel_local = np.einsum(
+            "tji,tj->ti", R_mats, resampled_base_lin_vel_mixed
         )
         resampled_base_ang_vel_local = self._compute_ang_vel(
             resampled_base_orientations, simulation_dt, local=True
