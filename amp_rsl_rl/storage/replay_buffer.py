@@ -67,8 +67,8 @@ class ReplayBuffer:
             next_states (Tensor): Batch of next states (batch_size, obs_dim).
         """
         # Move incoming data to buffer device if necessary
-        states = states.to(self.device)
-        next_states = next_states.to(self.device)
+        states = states.to(self.device, non_blocking=True)
+        next_states = next_states.to(self.device, non_blocking=True)
 
         batch_size = states.shape[0]
         end = self.step + batch_size

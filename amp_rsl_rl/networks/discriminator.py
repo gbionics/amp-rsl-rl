@@ -122,7 +122,10 @@ class Discriminator(nn.Module):
         return augmented if augmented is not None else tensor
 
     def forward(
-        self, x: torch.Tensor, return_trunk: bool = False
+        self,
+        x: torch.Tensor,
+        return_trunk: bool = False,
+        normalize_input: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the discriminator.
 
@@ -130,18 +133,21 @@ class Discriminator(nn.Module):
             x (Tensor): Input tensor (batch_size, input_dim).
             return_trunk (bool): If True, also return trunk features before
                 minibatch-std concatenation so callers can reuse them.
+            normalize_input (bool): If True, normalize the state and next-state
+                halves using the empirical normalizer. Set to False when inputs
+                were already normalized upstream to avoid redundant work.
 
         Returns:
             Tensor or tuple[Tensor, Tensor]: Discriminator logits, and optionally
                 trunk features.
         """
 
-        # Normalize AMP observations. If not enabled the normalizer is identity.
-        # split state and next_state and apply normalization
-        state, next_state = torch.split(x, self.input_dim // 2, dim=-1)
-        state = self.amp_normalizer(state)
-        next_state = self.amp_normalizer(next_state)
-        x = torch.cat([state, next_state], dim=-1)
+        if normalize_input:
+            # Normalize AMP observations. If not enabled the normalizer is identity.
+            state, next_state = torch.split(x, self.input_dim // 2, dim=-1)
+            state = self.amp_normalizer(state)
+            next_state = self.amp_normalizer(next_state)
+            x = torch.cat([state, next_state], dim=-1)
 
         trunk_out = self.trunk(x)
         h = trunk_out
@@ -240,16 +246,20 @@ class Discriminator(nn.Module):
         lambda_: float = 10,
         expert_trunk_out: torch.Tensor | None = None,
         expert_input: torch.Tensor | None = None,
+        inputs_normalized: bool = False,
     ):
         """Compute discriminator loss and gradient penalty.
 
         ``expert_trunk_out`` can be passed from a previous forward pass to avoid
         a redundant trunk evaluation during BCE gradient-penalty computation.
+        ``inputs_normalized`` allows callers to skip repeated empirical
+        normalization when batches were pre-normalized before forward.
         """
 
         # Compute gradient penalty to stabilize discriminator training.
-        sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
-        sample_amp_policy = tuple(self.amp_normalizer(s) for s in sample_amp_policy)
+        if not inputs_normalized:
+            sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
+            sample_amp_policy = tuple(self.amp_normalizer(s) for s in sample_amp_policy)
         grad_pen_loss = self.compute_grad_pen(
             expert_states=sample_amp_expert,
             policy_states=sample_amp_policy,

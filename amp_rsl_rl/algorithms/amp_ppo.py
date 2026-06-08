@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Optional, Tuple, Dict, Any, Union, Sequence
 
 import torch
@@ -98,6 +99,9 @@ class AMP_PPO:
         amp_replay_buffer_size: int = 100000,
         use_smooth_ratio_clipping: bool = False,
         normalize_advantage_per_mini_batch: bool = False,
+        use_automatic_mixed_precision: bool = False,
+        use_amp: Optional[bool] = None,
+        amp_dtype: str = "float16",
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
     ) -> None:
@@ -108,6 +112,28 @@ class AMP_PPO:
         self.learning_rate: float = learning_rate
         self.normalize_advantage_per_mini_batch: bool = (
             normalize_advantage_per_mini_batch
+        )
+        amp_enabled_flag = (
+            bool(use_automatic_mixed_precision)
+            if use_amp is None
+            else bool(use_amp)
+        )
+        self.use_automatic_mixed_precision: bool = amp_enabled_flag and str(
+            self.device
+        ).startswith("cuda")
+        _amp_dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if amp_dtype not in _amp_dtype_map:
+            raise ValueError(
+                f"Unsupported amp_dtype '{amp_dtype}'. Use one of {list(_amp_dtype_map.keys())}."
+            )
+        self.amp_dtype: str = amp_dtype
+        self._amp_torch_dtype = _amp_dtype_map[amp_dtype]
+        self._grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=self.use_automatic_mixed_precision
+            and self._amp_torch_dtype == torch.float16
         )
 
         if RSL_RL_V4_PLUS:
@@ -609,41 +635,51 @@ class AMP_PPO:
                 advantages_batch = self._repeat_along_batch(advantages_batch, num_aug)
                 returns_batch = self._repeat_along_batch(returns_batch, num_aug)
 
-            # Forward pass through the actor to get current policy outputs.
-            if RSL_RL_V4_PLUS:
-                _ = self.actor(
-                    obs_batch,
-                    masks=masks_batch,
-                    hidden_state=hidden_state_actor,
-                    stochastic_output=True,
+            autocast_ctx = (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self._amp_torch_dtype,
+                    enabled=self.use_automatic_mixed_precision,
                 )
-                actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
-                value_batch = self.critic(
-                    obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
-                )
-                if hasattr(self.actor, "get_distribution_params"):
-                    dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0][:original_batch_size]
-                    sigma_batch = dist_params[1][:original_batch_size]
-                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
+                if self.use_automatic_mixed_precision
+                else nullcontext()
+            )
+            with autocast_ctx:
+                # Forward pass through the actor to get current policy outputs.
+                if RSL_RL_V4_PLUS:
+                    _ = self.actor(
+                        obs_batch,
+                        masks=masks_batch,
+                        hidden_state=hidden_state_actor,
+                        stochastic_output=True,
+                    )
+                    actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
+                    value_batch = self.critic(
+                        obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
+                    )
+                    if hasattr(self.actor, "get_distribution_params"):
+                        dist_params = self.actor.get_distribution_params()
+                        mu_batch = dist_params[0][:original_batch_size]
+                        sigma_batch = dist_params[1][:original_batch_size]
+                        entropy_batch = self.actor.get_entropy()[:original_batch_size]
+                    else:
+                        mu_batch = self.actor.output_mean[:original_batch_size]
+                        sigma_batch = self.actor.output_std[:original_batch_size]
+                        entropy_batch = self.actor.output_entropy[:original_batch_size]
                 else:
-                    mu_batch = self.actor.output_mean[:original_batch_size]
-                    sigma_batch = self.actor.output_std[:original_batch_size]
-                    entropy_batch = self.actor.output_entropy[:original_batch_size]
-            else:
-                # v3
-                self.actor_critic.act(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
-                )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
-                    actions_batch
-                )
-                value_batch = self.actor_critic.evaluate(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
-                )
-                mu_batch = self.actor_critic.action_mean[:original_batch_size]
-                sigma_batch = self.actor_critic.action_std[:original_batch_size]
-                entropy_batch = self.actor_critic.entropy[:original_batch_size]
+                    # v3
+                    self.actor_critic.act(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
+                    )
+                    actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                        actions_batch
+                    )
+                    value_batch = self.actor_critic.evaluate(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
+                    )
+                    mu_batch = self.actor_critic.action_mean[:original_batch_size]
+                    sigma_batch = self.actor_critic.action_std[:original_batch_size]
+                    entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -669,45 +705,46 @@ class AMP_PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Compute the PPO surrogate loss.
-            ratio = torch.exp(
-                actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
-            )
-
-            min_ = 1.0 - self.clip_param
-            max_ = 1.0 + self.clip_param
-            # Smooth clipping for the ratio if enabled.
-            if self.use_smooth_ratio_clipping:
-                clipped_ratio = (
-                    1
-                    / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4))
-                    * (max_ - min_)
-                    + min_
+            with autocast_ctx:
+                # Compute the PPO surrogate loss.
+                ratio = torch.exp(
+                    actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
                 )
-            else:
-                clipped_ratio = torch.clamp(ratio, min_, max_)
 
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+                min_ = 1.0 - self.clip_param
+                max_ = 1.0 + self.clip_param
+                # Smooth clipping for the ratio if enabled.
+                if self.use_smooth_ratio_clipping:
+                    clipped_ratio = (
+                        1
+                        / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4))
+                        * (max_ - min_)
+                        + min_
+                    )
+                else:
+                    clipped_ratio = torch.clamp(ratio, min_, max_)
 
-            # Compute the value function loss.
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (
-                    value_batch - target_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                surrogate = -torch.squeeze(advantages_batch) * ratio
+                surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
-            ppo_loss = (
-                surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-            )
+                # Compute the value function loss.
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (
+                        value_batch - target_values_batch
+                    ).clamp(-self.clip_param, self.clip_param)
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+
+                # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
+                ppo_loss = (
+                    surrogate_loss
+                    + self.value_loss_coef * value_loss
+                    - self.entropy_coef * entropy_batch.mean()
+                )
 
             # Mirror loss (if enabled)
             symmetry_loss_value = torch.zeros(1, device=self.device)
@@ -777,22 +814,37 @@ class AMP_PPO:
             expert_state = expert_state.to(self.device, non_blocking=True)
             expert_next_state = expert_next_state.to(self.device, non_blocking=True)
 
+            # Keep raw tensors for normalizer updates
+            policy_state_raw = policy_state.detach().clone()
+            policy_next_state_raw = policy_next_state.detach().clone()
+            expert_state_raw = expert_state.detach().clone()
+            expert_next_state_raw = expert_next_state.detach().clone()
+
+            # Normalize once and reuse for logits + gradient penalty.
+            policy_state_n = self.discriminator.amp_normalizer(policy_state)
+            policy_next_state_n = self.discriminator.amp_normalizer(policy_next_state)
+            expert_state_n = self.discriminator.amp_normalizer(expert_state)
+            expert_next_state_n = self.discriminator.amp_normalizer(expert_next_state)
+
             # Build expert inputs with gradients enabled so R1 penalty can reuse
             # trunk activations from the same forward pass.
-            expert_state_gp = expert_state.detach().requires_grad_(True)
-            expert_next_state_gp = expert_next_state.detach().requires_grad_(True)
+            expert_state_gp = expert_state_n.detach().requires_grad_(True)
+            expert_next_state_gp = expert_next_state_n.detach().requires_grad_(True)
 
             # Concatenate policy and expert AMP observations for the discriminator input.
             B_pol = policy_state.size(0)
-            policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
+            policy_input = torch.cat([policy_state_n, policy_next_state_n], dim=-1)
             expert_input = torch.cat([expert_state_gp, expert_next_state_gp], dim=-1)
             discriminator_input = torch.cat(
                 (policy_input, expert_input),
                 dim=0,
             )
-            discriminator_output, discriminator_trunk = self.discriminator(
-                discriminator_input, return_trunk=True
-            )
+            with autocast_ctx:
+                discriminator_output, discriminator_trunk = self.discriminator(
+                    discriminator_input,
+                    return_trunk=True,
+                    normalize_input=False,
+                )
             policy_d, expert_d = (
                 discriminator_output[:B_pol],
                 discriminator_output[B_pol:],
@@ -800,37 +852,56 @@ class AMP_PPO:
             expert_trunk = discriminator_trunk[B_pol:]
 
             # Compute discriminator losses
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d=policy_d,
-                expert_d=expert_d,
-                sample_amp_expert=(expert_state_gp, expert_next_state_gp),
-                sample_amp_policy=(policy_state, policy_next_state),
-                lambda_=10,
-                expert_trunk_out=expert_trunk,
-                expert_input=expert_input,
-            )
+            with autocast_ctx:
+                amp_loss, grad_pen_loss = self.discriminator.compute_loss(
+                    policy_d=policy_d,
+                    expert_d=expert_d,
+                    sample_amp_expert=(expert_state_gp, expert_next_state_gp),
+                    sample_amp_policy=(policy_state_n, policy_next_state_n),
+                    lambda_=10,
+                    expert_trunk_out=expert_trunk,
+                    expert_input=expert_input,
+                    inputs_normalized=True,
+                )
 
             # The final loss combines the PPO loss with AMP losses.
             loss = ppo_loss + (amp_loss + grad_pen_loss)
 
             # Backpropagation and optimizer step.
-            self.optimizer.zero_grad()
-            loss.backward()
-            if RSL_RL_V4_PLUS:
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self.optimizer.zero_grad(set_to_none=True)
+            if self._grad_scaler.is_enabled():
+                self._grad_scaler.scale(loss).backward()
+                self._grad_scaler.unscale_(self.optimizer)
+                if RSL_RL_V4_PLUS:
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(
+                        self.critic.parameters(), self.max_grad_norm
+                    )
+                else:
+                    nn.utils.clip_grad_norm_(
+                        self.actor_critic.parameters(), self.max_grad_norm
+                    )
+                self._grad_scaler.step(self.optimizer)
+                self._grad_scaler.update()
             else:
-                nn.utils.clip_grad_norm_(
-                    self.actor_critic.parameters(), self.max_grad_norm
-                )
-            self.optimizer.step()
+                loss.backward()
+                if RSL_RL_V4_PLUS:
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(
+                        self.critic.parameters(), self.max_grad_norm
+                    )
+                else:
+                    nn.utils.clip_grad_norm_(
+                        self.actor_critic.parameters(), self.max_grad_norm
+                    )
+                self.optimizer.step()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
             self.discriminator.update_normalization(
-                policy_state.detach(),
-                policy_next_state.detach(),
-                expert_state.detach(),
-                expert_next_state.detach(),
+                expert_state_raw,
+                expert_next_state_raw,
+                policy_state_raw,
+                policy_next_state_raw,
             )
 
             # Compute probabilities from the discriminator logits.

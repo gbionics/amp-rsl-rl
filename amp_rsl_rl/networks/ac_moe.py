@@ -8,7 +8,6 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Normal
 from amp_rsl_rl.utils._compat import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation

@@ -1,5 +1,4 @@
 import os
-import re
 import warnings
 import wandb
 from rsl_rl.utils.wandb_utils import WandbSummaryWriter as RslWandbSummaryWriter
@@ -80,34 +79,28 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
     # Update the run name with a sequence number. This function is useful to
     # replicate the same behaviour of rsl-rl-lib before v2.3.0
     def update_run_name_with_sequence(self, prefix: str) -> None:
-        """Assign a monotonic run suffix using server-side filtered W&B queries.
-
-        Filtering by regex on the API side avoids scanning the full project run
-        history, which scales poorly on long-running projects.
-        """
         # Retrieve the current wandb run details (project and entity)
         project = wandb.run.project
         entity = wandb.run.entity
 
-        # Query only runs matching prefix + numeric suffix.
+        # Use wandb's API to list all runs in your project
         api = wandb.Api()
-        escaped_prefix = re.escape(prefix)
-        runs = api.runs(
-            f"{entity}/{project}",
-            filters={"display_name": {"$regex": f"^{escaped_prefix}\\d+$"}},
-            order="-created_at",
-            per_page=10,
-        )
+        runs = api.runs(f"{entity}/{project}")
 
         max_num = 0
         # Iterate through runs to extract the numeric suffix after the prefix.
         for run in runs:
-            match = re.fullmatch(rf"{escaped_prefix}(\d+)", run.name)
-            if match is None:
-                continue
-            run_num = int(match.group(1))
-            if run_num > max_num:
-                max_num = run_num
+            if run.name.startswith(prefix):
+                # Extract the numeric part from the run name.
+                numeric_suffix = run.name[
+                    len(prefix) :
+                ]  # e.g., from "prefix564", get "564"
+                try:
+                    run_num = int(numeric_suffix)
+                    if run_num > max_num:
+                        max_num = run_num
+                except ValueError:
+                    continue
 
         # Increment to get the new run number
         new_num = max_num + 1

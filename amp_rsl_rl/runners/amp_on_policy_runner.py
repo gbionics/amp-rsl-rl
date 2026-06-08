@@ -440,7 +440,7 @@ class AMPOnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs = self.env.get_observations().to(self.device)
+        obs = self.env.get_observations().to(self.device, non_blocking=True)
         amp_obs = self._flatten_amp_obs(obs["amp"])
         self.train_mode()  # switch to train mode (for dropout for example)
 
@@ -473,9 +473,9 @@ class AMPOnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(
                         actions.to(self.env.device)
                     )
-                    obs = obs.to(self.device)
-                    rewards = rewards.to(self.device)
-                    dones = dones.to(self.device)
+                    obs = obs.to(self.device, non_blocking=True)
+                    rewards = rewards.to(self.device, non_blocking=True)
+                    dones = dones.to(self.device, non_blocking=True)
 
                     next_amp_obs = self._flatten_amp_obs(obs["amp"])
                     style_rewards = self.discriminator.predict_reward(

@@ -392,10 +392,25 @@ class AMPLoader:
             ]
         )
         self.per_frame_weights_reset = per_frame_reset / per_frame_reset.sum()
-        expected_device_type = str(device).split(":")[0]
-        assert self.all_obs.device.type == expected_device_type, (
-            f"AMPLoader tensors are on {self.all_obs.device}, expected {device}"
+
+        # Precompute per-dataset lengths and offsets for O(D + n) hierarchical sampling.
+        self._ds_lengths_aug = torch.tensor(
+            augmented_lengths, device=self.device, dtype=torch.long
         )
+        self._ds_lengths_aug_f = self._ds_lengths_aug.to(dtype=torch.float32)
+        self._ds_offsets_aug = torch.zeros_like(self._ds_lengths_aug)
+        self._ds_offsets_aug[1:] = self._ds_lengths_aug[:-1].cumsum(0)
+
+        self._ds_lengths_reset = torch.tensor(
+            original_lengths, device=self.device, dtype=torch.long
+        )
+        self._ds_lengths_reset_f = self._ds_lengths_reset.to(dtype=torch.float32)
+        self._ds_offsets_reset = torch.zeros_like(self._ds_lengths_reset)
+        self._ds_offsets_reset[1:] = self._ds_lengths_reset[:-1].cumsum(0)
+
+        # Empirical crossover: flat multinomial is faster for small buffers,
+        # hierarchical sampling wins once the flattened frame count is large.
+        self._hierarchical_sampling_threshold = 75_000
 
     def _apply_symmetry(
         self,
@@ -413,6 +428,34 @@ class AMPLoader:
         aug_obs, _ = _call_augmentation_func(aug_fn, obs=obs, obs_type=obs_type)
 
         return aug_obs if aug_obs is not None else obs
+
+    def _sample_frame_indices(
+        self, total: int, for_reset: bool = False
+    ) -> torch.Tensor:
+        """Sample frame indices with an adaptive backend while preserving distribution.
+
+        For smaller flattened buffers, direct flat multinomial is typically
+        faster. For larger buffers, two-level dataset-then-frame sampling avoids
+        large alias-setup overhead. Both backends produce the same target
+        per-frame sampling probabilities.
+        """
+        if for_reset:
+            flat_weights = self.per_frame_weights_reset
+            lengths = self._ds_lengths_reset_f
+            offsets = self._ds_offsets_reset
+            total_frames = self.all_states.shape[0]
+        else:
+            flat_weights = self.per_frame_weights
+            lengths = self._ds_lengths_aug_f
+            offsets = self._ds_offsets_aug
+            total_frames = self.all_obs.shape[0]
+
+        if total_frames < self._hierarchical_sampling_threshold:
+            return torch.multinomial(flat_weights, total, replacement=True)
+
+        ds_draws = torch.multinomial(self.dataset_weights, total, replacement=True)
+        local_f = (torch.rand(total, device=self.device) * lengths[ds_draws]).long()
+        return offsets[ds_draws] + local_f
 
     def _resample_data_Rn(
         self,
@@ -470,9 +513,6 @@ class AMPLoader:
         """
         Loads and processes one motion dataset.
 
-        Joint reordering and frame transforms are vectorized to avoid per-frame
-        Python loops while preserving numerical equivalence.
-
         Returns:
             MotionData instance
         """
@@ -487,13 +527,14 @@ class AMPLoader:
             else:
                 idx_map.append(None)
 
-        # Reorder joint positions with vectorized advanced indexing.
-        jp_array = np.asarray(data["joint_positions"])
-        jp_list = np.zeros((jp_array.shape[0], len(idx_map)), dtype=jp_array.dtype)
-        valid = [(dst, src) for dst, src in enumerate(idx_map) if src is not None]
-        if valid:
-            dst_cols, src_cols = map(list, zip(*valid))
-            jp_list[:, dst_cols] = jp_array[:, src_cols]
+        # reorder & fill joint positions
+        jp_list: List[np.ndarray] = []
+        for frame in data["joint_positions"]:
+            arr = np.zeros((len(idx_map),), dtype=frame.dtype)
+            for i, src_idx in enumerate(idx_map):
+                if src_idx is not None:
+                    arr[i] = frame[src_idx]
+            jp_list.append(arr)
 
         if isinstance(data["fps"], np.ndarray):
             fps = float(data["fps"].reshape(-1)[0])
@@ -525,10 +566,13 @@ class AMPLoader:
             resampled_base_orientations, simulation_dt, local=False
         )
 
-        # Vectorized local linear velocity: R^T @ v for all frames.
-        R_mats = resampled_base_orientations.as_matrix()
-        resampled_base_lin_vel_local = np.einsum(
-            "tji,tj->ti", R_mats, resampled_base_lin_vel_mixed
+        resampled_base_lin_vel_local = np.stack(
+            [
+                R.as_matrix().T @ v
+                for R, v in zip(
+                    resampled_base_orientations, resampled_base_lin_vel_mixed
+                )
+            ]
         )
         resampled_base_ang_vel_local = self._compute_ang_vel(
             resampled_base_orientations, simulation_dt, local=True
@@ -549,8 +593,12 @@ class AMPLoader:
         self, num_mini_batch: int, mini_batch_size: int
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
         """
-        Yields mini-batches of (state, next_state) pairs for training,
-        sampled directly from precomputed buffers.
+        Yields mini-batches of (state, next_state) pairs for training.
+
+        Sampling draws all epoch indices once and uses an adaptive backend:
+        flat multinomial for smaller buffers and hierarchical sampling for
+        larger ones. Both paths are mathematically equivalent to the original
+        per-frame distribution and then sliced into mini-batches.
 
         Args:
             num_mini_batch: Number of mini-batches to yield
@@ -558,19 +606,24 @@ class AMPLoader:
         Yields:
             Tuple of (state, next_state) tensors
         """
-        for _ in range(num_mini_batch):
-            idx = torch.multinomial(
-                self.per_frame_weights, mini_batch_size, replacement=True
-            )
-            yield self.all_obs[idx], self.all_next_obs[idx]
+        total = num_mini_batch * mini_batch_size
+        idx = self._sample_frame_indices(total, for_reset=False)
+
+        for i in range(num_mini_batch):
+            sl = slice(i * mini_batch_size, (i + 1) * mini_batch_size)
+            mb_idx = idx[sl]
+            yield self.all_obs[mb_idx], self.all_next_obs[mb_idx]
 
     def get_state_for_reset(
         self,
         number_of_samples: int,
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Randomly samples full states for environment resets,
-        sampled directly from the precomputed state buffer.
+        Randomly samples full states for environment resets.
+
+        Sampling uses the same adaptive backend as discriminator batches:
+        it keeps the original per-frame distribution exactly while selecting
+        the faster of flat and hierarchical sampling for the current buffer size.
 
         The velocity representation used is the one specified at construction time.
 
@@ -579,9 +632,7 @@ class AMPLoader:
         Returns:
             Tuple of (quat, joint_positions, joint_velocities, base_lin_velocities, base_ang_velocities)
         """
-        idx = torch.multinomial(
-            self.per_frame_weights_reset, number_of_samples, replacement=True
-        )
+        idx = self._sample_frame_indices(number_of_samples, for_reset=True)
         full = self.all_states[idx]
         joint_dim = self.motion_data[0].joint_positions.shape[1]
 
