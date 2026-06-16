@@ -72,6 +72,12 @@ class AMP_PPO:
         Whether to normalize advantages within each mini-batch (instead of the entire rollout).
     symmetry_cfg : dict | None, default=None
         Configuration dict enabling symmetry-based data augmentation and mirror loss.
+    use_automatic_mixed_precision : bool, default=False
+        Enables PyTorch Automatic Mixed Precision (``torch.amp``) for the update
+        step. Forward passes and most losses run under ``torch.autocast`` while a
+        ``GradScaler`` keeps the (scaled) backward pass numerically stable. The
+        discriminator gradient penalty is always computed in full precision. Only
+        effective on CUDA devices.
     device : str, default="cpu"
         Torch device used by the module.
     """
@@ -99,6 +105,7 @@ class AMP_PPO:
         use_smooth_ratio_clipping: bool = False,
         normalize_advantage_per_mini_batch: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        use_automatic_mixed_precision: bool = False,
         device: str = "cpu",
     ) -> None:
         # Set device and learning hyperparameters
@@ -108,6 +115,18 @@ class AMP_PPO:
         self.learning_rate: float = learning_rate
         self.normalize_advantage_per_mini_batch: bool = (
             normalize_advantage_per_mini_batch
+        )
+
+        # ─── Automatic Mixed Precision (torch.amp) ───
+        # AMP only provides speedups on CUDA; silently disable it elsewhere.
+        self._amp_device_type: str = "cuda" if "cuda" in str(device) else "cpu"
+        self.use_automatic_mixed_precision: bool = (
+            use_automatic_mixed_precision and self._amp_device_type == "cuda"
+        )
+        # GradScaler is a no-op passthrough when ``enabled=False`` so it is safe
+        # to route every backward/step through it unconditionally.
+        self.grad_scaler = torch.amp.GradScaler(
+            self._amp_device_type, enabled=self.use_automatic_mixed_precision
         )
 
         if RSL_RL_V4_PLUS:
@@ -604,210 +623,233 @@ class AMP_PPO:
                 advantages_batch = self._repeat_along_batch(advantages_batch, num_aug)
                 returns_batch = self._repeat_along_batch(returns_batch, num_aug)
 
-            # Forward pass through the actor to get current policy outputs.
-            if RSL_RL_V4_PLUS:
-                _ = self.actor(
-                    obs_batch,
-                    masks=masks_batch,
-                    hidden_state=hidden_state_actor,
-                    stochastic_output=True,
-                )
-                actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
-                value_batch = self.critic(
-                    obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
-                )
-                if hasattr(self.actor, "get_distribution_params"):
-                    dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0][:original_batch_size]
-                    sigma_batch = dist_params[1][:original_batch_size]
-                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
-                else:
-                    mu_batch = self.actor.output_mean[:original_batch_size]
-                    sigma_batch = self.actor.output_std[:original_batch_size]
-                    entropy_batch = self.actor.output_entropy[:original_batch_size]
-            else:
-                # v3
-                self.actor_critic.act(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
-                )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
-                    actions_batch
-                )
-                value_batch = self.actor_critic.evaluate(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
-                )
-                mu_batch = self.actor_critic.action_mean[:original_batch_size]
-                sigma_batch = self.actor_critic.action_std[:original_batch_size]
-                entropy_batch = self.actor_critic.entropy[:original_batch_size]
-
-            # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (
-                            torch.square(old_sigma_batch)
-                            + torch.square(old_mu_batch - mu_batch)
-                        )
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    )
-                    kl_mean = torch.mean(kl)
-                    mean_kl_divergence += kl_mean.item()
-
-                    if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
-
-            # Compute the PPO surrogate loss.
-            ratio = torch.exp(
-                actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
-            )
-
-            min_ = 1.0 - self.clip_param
-            max_ = 1.0 + self.clip_param
-            # Smooth clipping for the ratio if enabled.
-            if self.use_smooth_ratio_clipping:
-                clipped_ratio = (
-                    1
-                    / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4))
-                    * (max_ - min_)
-                    + min_
-                )
-            else:
-                clipped_ratio = torch.clamp(ratio, min_, max_)
-
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-            # Compute the value function loss.
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (
-                    value_batch - target_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
-
-            # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
-            ppo_loss = (
-                surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-            )
-
-            # Mirror loss (if enabled)
-            symmetry_loss_value = torch.zeros(1, device=self.device)
-            if self.symmetry_cfg:
-                if not self.symmetry_cfg.get("use_data_augmentation", False):
-                    sym_obs_batch, _ = self._apply_symmetry(
-                        obs=obs_batch[:original_batch_size],
-                        actions=None,
-                        obs_type="policy",
-                    )
-                else:
-                    sym_obs_batch = obs_batch
-
-                if sym_obs_batch is not None:
-                    with torch.no_grad():
-                        sym_obs_detached = sym_obs_batch.detach().clone()
-                    if RSL_RL_V4_PLUS:
-                        mean_actions_batch = self.actor(
-                            sym_obs_detached, stochastic_output=False
-                        )
-                    else:
-                        mean_actions_batch = self.actor_critic.act_inference(
-                            sym_obs_detached
-                        )
-                    action_mean_orig = mean_actions_batch[:original_batch_size]
-                    _, sym_actions = self._apply_symmetry(
-                        obs=None,
-                        actions=action_mean_orig,
-                        obs_type="policy",
-                    )
-                    if sym_actions is None:
-                        sym_actions = mean_actions_batch
-                    mse_loss = torch.nn.MSELoss()
-                    symmetry_loss_value = mse_loss(
-                        mean_actions_batch[original_batch_size:],
-                        sym_actions.detach()[original_batch_size:],
-                    )
-                    if self.symmetry_cfg.get("use_mirror_loss", False):
-                        coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
-                        ppo_loss = ppo_loss + coeff * symmetry_loss_value
-                    else:
-                        symmetry_loss_value = symmetry_loss_value.detach()
-
-            # Process AMP loss by unpacking policy and expert AMP samples.
-            policy_state, policy_next_state = sample_amp_policy
-            expert_state, expert_next_state = sample_amp_expert
-
-            if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_data_augmentation", False
+            # Forward pass + loss computation run under autocast when AMP is
+            # enabled. The backward/optimizer step stays outside the context
+            # (PyTorch recommendation); the discriminator gradient penalty is
+            # forced back to full precision inside ``compute_grad_pen``.
+            with torch.autocast(
+                device_type=self._amp_device_type,
+                enabled=self.use_automatic_mixed_precision,
             ):
-                policy_state = self.discriminator.apply_symmetry(
-                    policy_state, obs_type="amp"
+                # Forward pass through the actor to get current policy outputs.
+                if RSL_RL_V4_PLUS:
+                    _ = self.actor(
+                        obs_batch,
+                        masks=masks_batch,
+                        hidden_state=hidden_state_actor,
+                        stochastic_output=True,
+                    )
+                    actions_log_prob_batch = self.actor.get_output_log_prob(
+                        actions_batch
+                    )
+                    value_batch = self.critic(
+                        obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
+                    )
+                    if hasattr(self.actor, "get_distribution_params"):
+                        dist_params = self.actor.get_distribution_params()
+                        mu_batch = dist_params[0][:original_batch_size]
+                        sigma_batch = dist_params[1][:original_batch_size]
+                        entropy_batch = self.actor.get_entropy()[:original_batch_size]
+                    else:
+                        mu_batch = self.actor.output_mean[:original_batch_size]
+                        sigma_batch = self.actor.output_std[:original_batch_size]
+                        entropy_batch = self.actor.output_entropy[:original_batch_size]
+                else:
+                    # v3
+                    self.actor_critic.act(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
+                    )
+                    actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                        actions_batch
+                    )
+                    value_batch = self.actor_critic.evaluate(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
+                    )
+                    mu_batch = self.actor_critic.action_mean[:original_batch_size]
+                    sigma_batch = self.actor_critic.action_std[:original_batch_size]
+                    entropy_batch = self.actor_critic.entropy[:original_batch_size]
+
+                # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
+                if self.desired_kl is not None and self.schedule == "adaptive":
+                    with torch.inference_mode():
+                        kl = torch.sum(
+                            torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                            + (
+                                torch.square(old_sigma_batch)
+                                + torch.square(old_mu_batch - mu_batch)
+                            )
+                            / (2.0 * torch.square(sigma_batch))
+                            - 0.5,
+                            axis=-1,
+                        )
+                        kl_mean = torch.mean(kl)
+                        mean_kl_divergence += kl_mean.item()
+
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
+
+                # Compute the PPO surrogate loss.
+                ratio = torch.exp(
+                    actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
                 )
-                policy_next_state = self.discriminator.apply_symmetry(
-                    policy_next_state, obs_type="amp"
+
+                min_ = 1.0 - self.clip_param
+                max_ = 1.0 + self.clip_param
+                # Smooth clipping for the ratio if enabled.
+                if self.use_smooth_ratio_clipping:
+                    clipped_ratio = (
+                        1
+                        / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4))
+                        * (max_ - min_)
+                        + min_
+                    )
+                else:
+                    clipped_ratio = torch.clamp(ratio, min_, max_)
+
+                surrogate = -torch.squeeze(advantages_batch) * ratio
+                surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+                # Compute the value function loss.
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (
+                        value_batch - target_values_batch
+                    ).clamp(-self.clip_param, self.clip_param)
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+
+                # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
+                ppo_loss = (
+                    surrogate_loss
+                    + self.value_loss_coef * value_loss
+                    - self.entropy_coef * entropy_batch.mean()
                 )
-                expert_state = self.discriminator.apply_symmetry(
-                    expert_state, obs_type="amp"
+
+                # Mirror loss (if enabled)
+                symmetry_loss_value = torch.zeros(1, device=self.device)
+                if self.symmetry_cfg:
+                    if not self.symmetry_cfg.get("use_data_augmentation", False):
+                        sym_obs_batch, _ = self._apply_symmetry(
+                            obs=obs_batch[:original_batch_size],
+                            actions=None,
+                            obs_type="policy",
+                        )
+                    else:
+                        sym_obs_batch = obs_batch
+
+                    if sym_obs_batch is not None:
+                        with torch.no_grad():
+                            sym_obs_detached = sym_obs_batch.detach().clone()
+                        if RSL_RL_V4_PLUS:
+                            mean_actions_batch = self.actor(
+                                sym_obs_detached, stochastic_output=False
+                            )
+                        else:
+                            mean_actions_batch = self.actor_critic.act_inference(
+                                sym_obs_detached
+                            )
+                        action_mean_orig = mean_actions_batch[:original_batch_size]
+                        _, sym_actions = self._apply_symmetry(
+                            obs=None,
+                            actions=action_mean_orig,
+                            obs_type="policy",
+                        )
+                        if sym_actions is None:
+                            sym_actions = mean_actions_batch
+                        mse_loss = torch.nn.MSELoss()
+                        symmetry_loss_value = mse_loss(
+                            mean_actions_batch[original_batch_size:],
+                            sym_actions.detach()[original_batch_size:],
+                        )
+                        if self.symmetry_cfg.get("use_mirror_loss", False):
+                            coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
+                            ppo_loss = ppo_loss + coeff * symmetry_loss_value
+                        else:
+                            symmetry_loss_value = symmetry_loss_value.detach()
+
+                # Process AMP loss by unpacking policy and expert AMP samples.
+                policy_state, policy_next_state = sample_amp_policy
+                expert_state, expert_next_state = sample_amp_expert
+
+                if self.symmetry_cfg and self.symmetry_cfg.get(
+                    "use_data_augmentation", False
+                ):
+                    policy_state = self.discriminator.apply_symmetry(
+                        policy_state, obs_type="amp"
+                    )
+                    policy_next_state = self.discriminator.apply_symmetry(
+                        policy_next_state, obs_type="amp"
+                    )
+                    expert_state = self.discriminator.apply_symmetry(
+                        expert_state, obs_type="amp"
+                    )
+                    expert_next_state = self.discriminator.apply_symmetry(
+                        expert_next_state, obs_type="amp"
+                    )
+
+                # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
+                policy_state = policy_state.to(self.device)
+                policy_next_state = policy_next_state.to(self.device)
+                expert_state = expert_state.to(self.device)
+                expert_next_state = expert_next_state.to(self.device)
+
+                # Keep raw tensors for normalizer updates. The discriminator forward
+                # and gradient-penalty paths never mutate these tensors in place, so
+                # the snapshot is only needed when empirical normalization is enabled
+                # (which consumes them after the optimizer step). When it is disabled
+                # (the common case) we skip four clones per mini-batch.
+                if self.discriminator.empirical_normalization:
+                    policy_state_raw = policy_state.detach().clone()
+                    policy_next_state_raw = policy_next_state.detach().clone()
+                    expert_state_raw = expert_state.detach().clone()
+                    expert_next_state_raw = expert_next_state.detach().clone()
+                else:
+                    policy_state_raw = policy_state
+                    policy_next_state_raw = policy_next_state
+                    expert_state_raw = expert_state
+                    expert_next_state_raw = expert_next_state
+
+                # Concatenate policy and expert AMP observations for the discriminator input.
+                B_pol = policy_state.size(0)
+                discriminator_input = torch.cat(
+                    (
+                        torch.cat([policy_state, policy_next_state], dim=-1),
+                        torch.cat([expert_state, expert_next_state], dim=-1),
+                    ),
+                    dim=0,
                 )
-                expert_next_state = self.discriminator.apply_symmetry(
-                    expert_next_state, obs_type="amp"
+                discriminator_output = self.discriminator(discriminator_input)
+                policy_d, expert_d = (
+                    discriminator_output[:B_pol],
+                    discriminator_output[B_pol:],
                 )
 
-            # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
-            policy_state = policy_state.to(self.device)
-            policy_next_state = policy_next_state.to(self.device)
-            expert_state = expert_state.to(self.device)
-            expert_next_state = expert_next_state.to(self.device)
+                # Compute discriminator losses
+                amp_loss, grad_pen_loss = self.discriminator.compute_loss(
+                    policy_d=policy_d,
+                    expert_d=expert_d,
+                    sample_amp_expert=(expert_state, expert_next_state),
+                    sample_amp_policy=(policy_state, policy_next_state),
+                    lambda_=10,
+                )
 
-            # Keep raw tensors for normalizer updates
-            policy_state_raw = policy_state.detach().clone()
-            policy_next_state_raw = policy_next_state.detach().clone()
-            expert_state_raw = expert_state.detach().clone()
-            expert_next_state_raw = expert_next_state.detach().clone()
+                # The final loss combines the PPO loss with AMP losses.
+                loss = ppo_loss + (amp_loss + grad_pen_loss)
 
-            # Concatenate policy and expert AMP observations for the discriminator input.
-            B_pol = policy_state.size(0)
-            discriminator_input = torch.cat(
-                (
-                    torch.cat([policy_state, policy_next_state], dim=-1),
-                    torch.cat([expert_state, expert_next_state], dim=-1),
-                ),
-                dim=0,
-            )
-            discriminator_output = self.discriminator(discriminator_input)
-            policy_d, expert_d = (
-                discriminator_output[:B_pol],
-                discriminator_output[B_pol:],
-            )
-
-            # Compute discriminator losses
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d=policy_d,
-                expert_d=expert_d,
-                sample_amp_expert=(expert_state, expert_next_state),
-                sample_amp_policy=(policy_state, policy_next_state),
-                lambda_=10,
-            )
-
-            # The final loss combines the PPO loss with AMP losses.
-            loss = ppo_loss + (amp_loss + grad_pen_loss)
-
-            # Backpropagation and optimizer step.
+            # Backpropagation and optimizer step (outside autocast). The scaler is
+            # a no-op passthrough when AMP is disabled.
             self.optimizer.zero_grad()
-            loss.backward()
+            self.grad_scaler.scale(loss).backward()
+            # Unscale before gradient clipping so max_grad_norm acts on true grads.
+            self.grad_scaler.unscale_(self.optimizer)
             if RSL_RL_V4_PLUS:
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
@@ -815,7 +857,8 @@ class AMP_PPO:
                 nn.utils.clip_grad_norm_(
                     self.actor_critic.parameters(), self.max_grad_norm
                 )
-            self.optimizer.step()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
 
             # Update the normalizer with RAW (unnormalized) observations under no_grad
             self.discriminator.update_normalization(

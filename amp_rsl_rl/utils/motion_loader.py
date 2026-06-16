@@ -379,6 +379,18 @@ class AMPLoader:
         )
         self.per_frame_weights = per_frame / per_frame.sum()
 
+        # When every frame has the same sampling weight (e.g. a single dataset,
+        # or datasets whose weight/length ratios match) uniform sampling via
+        # ``torch.randint`` is numerically equivalent to ``torch.multinomial``
+        # but much cheaper. Detect this once and use the fast path at runtime.
+        self._num_frames = self.per_frame_weights.shape[0]
+        self._uniform_weights = bool(
+            torch.allclose(
+                self.per_frame_weights,
+                self.per_frame_weights.new_full((), 1.0 / self._num_frames),
+            )
+        )
+
         # Build separate weights for reset states (not augmented)
         per_frame_reset = torch.cat(
             [
@@ -475,14 +487,13 @@ class AMPLoader:
             else:
                 idx_map.append(None)
 
-        # reorder & fill joint positions
-        jp_list: List[np.ndarray] = []
-        for frame in data["joint_positions"]:
-            arr = np.zeros((len(idx_map),), dtype=frame.dtype)
-            for i, src_idx in enumerate(idx_map):
-                if src_idx is not None:
-                    arr[i] = frame[src_idx]
-            jp_list.append(arr)
+        # reorder & fill joint positions (vectorized): stack all frames once, then
+        # copy the present joints via fancy indexing. Missing joints stay zero.
+        src_frames = np.stack(data["joint_positions"], axis=0)  # (T, N_src)
+        jp_list = np.zeros((src_frames.shape[0], len(idx_map)), dtype=src_frames.dtype)
+        cols_dst = [i for i, s in enumerate(idx_map) if s is not None]
+        cols_src = [s for s in idx_map if s is not None]
+        jp_list[:, cols_dst] = src_frames[:, cols_src]
 
         if isinstance(data["fps"], np.ndarray):
             fps = float(data["fps"].reshape(-1)[0])
@@ -514,13 +525,10 @@ class AMPLoader:
             resampled_base_orientations, simulation_dt, local=False
         )
 
-        resampled_base_lin_vel_local = np.stack(
-            [
-                R.as_matrix().T @ v
-                for R, v in zip(
-                    resampled_base_orientations, resampled_base_lin_vel_mixed
-                )
-            ]
+        # v_local = R^T @ v_world for every frame, computed in one vectorized call
+        # (Rotation.apply with inverse=True applies the transpose rotation).
+        resampled_base_lin_vel_local = resampled_base_orientations.apply(
+            resampled_base_lin_vel_mixed, inverse=True
         )
         resampled_base_ang_vel_local = self._compute_ang_vel(
             resampled_base_orientations, simulation_dt, local=True
@@ -551,9 +559,14 @@ class AMPLoader:
             Tuple of (state, next_state) tensors
         """
         for _ in range(num_mini_batch):
-            idx = torch.multinomial(
-                self.per_frame_weights, mini_batch_size, replacement=True
-            )
+            if self._uniform_weights:
+                idx = torch.randint(
+                    0, self._num_frames, (mini_batch_size,), device=self.device
+                )
+            else:
+                idx = torch.multinomial(
+                    self.per_frame_weights, mini_batch_size, replacement=True
+                )
             yield self.all_obs[idx], self.all_next_obs[idx]
 
     def get_state_for_reset(

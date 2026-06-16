@@ -264,10 +264,27 @@ class Discriminator(nn.Module):
         Returns:
             Tensor: Gradient penalty value.
         """
-        expert = torch.cat(expert_states, -1)
+        # The gradient penalty performs a double backward and is numerically
+        # sensitive, so it is always computed in full precision even when the
+        # surrounding update runs under autocast (AMP). Disabling autocast and
+        # casting the inputs to float keeps the trunk forward and the
+        # autograd.grad call in fp32.
+        autocast_ctx = torch.autocast(
+            device_type=expert_states[0].device.type, enabled=False
+        )
+        with autocast_ctx:
+            return self._compute_grad_pen_fp32(expert_states, policy_states, lambda_)
+
+    def _compute_grad_pen_fp32(
+        self,
+        expert_states: tuple[torch.Tensor, torch.Tensor],
+        policy_states: tuple[torch.Tensor, torch.Tensor],
+        lambda_: float = 10,
+    ) -> torch.Tensor:
+        expert = torch.cat(expert_states, -1).float()
 
         if self.loss_type == "Wasserstein":
-            policy = torch.cat(policy_states, -1)
+            policy = torch.cat(policy_states, -1).float()
             alpha = torch.rand(expert.size(0), 1, device=expert.device)
             alpha = alpha.expand_as(expert)
             data = alpha * expert + (1 - alpha) * policy
