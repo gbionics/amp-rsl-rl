@@ -704,9 +704,11 @@ class AMP_PPO:
                 - self.entropy_coef * entropy_batch.mean()
             )
 
-            # Mirror loss (if enabled)
+            # Mirror loss (only when it actually feeds the gradient; computing it
+            # for logging only would add a full extra actor forward pass per
+            # mini-batch, inflating Perf/learning_time even when symmetry is off).
             symmetry_loss_value = torch.zeros(1, device=self.device)
-            if self.symmetry_cfg:
+            if self.symmetry_cfg and self.symmetry_cfg.get("use_mirror_loss", False):
                 if not self.symmetry_cfg.get("use_data_augmentation", False):
                     sym_obs_batch, _ = self._apply_symmetry(
                         obs=obs_batch[:original_batch_size],
@@ -735,16 +737,12 @@ class AMP_PPO:
                     )
                     if sym_actions is None:
                         sym_actions = mean_actions_batch
-                    mse_loss = torch.nn.MSELoss()
-                    symmetry_loss_value = mse_loss(
+                    symmetry_loss_value = torch.nn.functional.mse_loss(
                         mean_actions_batch[original_batch_size:],
                         sym_actions.detach()[original_batch_size:],
                     )
-                    if self.symmetry_cfg.get("use_mirror_loss", False):
-                        coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
-                        ppo_loss = ppo_loss + coeff * symmetry_loss_value
-                    else:
-                        symmetry_loss_value = symmetry_loss_value.detach()
+                    coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
+                    ppo_loss = ppo_loss + coeff * symmetry_loss_value
 
             # Process AMP loss by unpacking policy and expert AMP samples.
             policy_state, policy_next_state = sample_amp_policy
