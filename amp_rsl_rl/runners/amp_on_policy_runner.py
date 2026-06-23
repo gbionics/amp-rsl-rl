@@ -452,8 +452,11 @@ class AMPOnPolicyRunner:
             start = time.time()
             # Rollout
 
-            mean_style_reward_log = 0
-            mean_task_reward_log = 0
+            # Accumulate on-device (zero-dim CUDA tensors) so that we do NOT
+            # force a GPU->CPU synchronization on every environment step. A single
+            # .item() sync is performed once per iteration, after the rollout.
+            mean_style_reward_log = torch.zeros((), device=self.device)
+            mean_task_reward_log = torch.zeros((), device=self.device)
 
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -471,8 +474,8 @@ class AMPOnPolicyRunner:
                         amp_obs, next_amp_obs
                     )
 
-                    mean_task_reward_log += rewards.mean().item()
-                    mean_style_reward_log += style_rewards.mean().item()
+                    mean_task_reward_log += rewards.mean()
+                    mean_style_reward_log += style_rewards.mean()
 
                     rewards = (
                         1 - self.style_weight
@@ -507,8 +510,9 @@ class AMPOnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(obs)
 
-            mean_style_reward_log /= self.num_steps_per_env
-            mean_task_reward_log /= self.num_steps_per_env
+            # Single synchronization point for the whole rollout.
+            mean_style_reward_log = mean_style_reward_log.item() / self.num_steps_per_env
+            mean_task_reward_log = mean_task_reward_log.item() / self.num_steps_per_env
 
             (
                 mean_value_loss,
