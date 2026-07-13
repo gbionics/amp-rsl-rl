@@ -99,6 +99,8 @@ class AMP_PPO:
         use_smooth_ratio_clipping: bool = False,
         normalize_advantage_per_mini_batch: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        moe_gate_entropy_coef: float = 0.0,
+        moe_gate_load_balance_coef: float = 0.0,
         device: str = "cpu",
     ) -> None:
         # Set device and learning hyperparameters
@@ -109,6 +111,8 @@ class AMP_PPO:
         self.normalize_advantage_per_mini_batch: bool = (
             normalize_advantage_per_mini_batch
         )
+        self.moe_gate_entropy_coef: float = moe_gate_entropy_coef
+        self.moe_gate_load_balance_coef: float = moe_gate_load_balance_coef
 
         if RSL_RL_V4_PLUS:
             if actor is None or critic is None:
@@ -215,6 +219,20 @@ class AMP_PPO:
                     "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
                 )
             self.symmetry_cfg = symmetry_cfg
+
+    def _moe_gate_weights(self) -> Optional[torch.Tensor]:
+        """Return the current MoE actor gate weights [batch, num_experts], if any.
+
+        Looks at whichever module exposes `moe_gate_weights` / `last_gate_weights`
+        (e.g. `ActorCriticMoE`), regardless of rsl-rl-lib version. Returns None for
+        any other actor type, so the regularization terms become a no-op.
+        """
+        source = self.actor if RSL_RL_V4_PLUS else self.actor_critic
+        weights = getattr(source, "moe_gate_weights", None)
+        if weights is None:
+            inner = getattr(source, "actor", None)
+            weights = getattr(inner, "last_gate_weights", None)
+        return weights
 
     def init_storage(
         self,
@@ -464,7 +482,7 @@ class AMP_PPO:
 
     def update(
         self,
-    ) -> Tuple[float, float, float, float, float, float, float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float, float, float, float, float]:
         """
         Performs a single update step for both the actor-critic (PPO) and the AMP discriminator.
         It iterates over mini-batches of data, computes surrogate, value, AMP and gradient penalty losses,
@@ -476,7 +494,7 @@ class AMP_PPO:
             A tuple containing mean losses and statistics:
             (mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss,
              mean_policy_pred, mean_expert_pred, mean_accuracy_policy, mean_accuracy_expert,
-             mean_kl_divergence, mean_symmetry_loss)
+             mean_kl_divergence, mean_symmetry_loss, mean_moe_gate_entropy)
         """
         # Initialize mean loss and accuracy statistics.
         mean_value_loss: float = 0.0
@@ -491,6 +509,7 @@ class AMP_PPO:
         mean_accuracy_expert_elem: float = 0.0
         mean_kl_divergence: float = 0.0
         mean_symmetry_loss: float = 0.0
+        mean_moe_gate_entropy: float = 0.0
 
         # Create data generators for mini-batch sampling.
         _is_recurrent = (
@@ -697,11 +716,36 @@ class AMP_PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # MoE gate regularization (no-op unless the actor is an ActorCriticMoE
+            # and at least one of the two coefficients is non-zero). Must run right
+            # after the forward pass above, since that's what populates the gate's
+            # `last_gate_weights` for this mini-batch.
+            moe_gate_entropy = torch.zeros((), device=self.device)
+            moe_gate_loss = torch.zeros((), device=self.device)
+            if self.moe_gate_entropy_coef != 0.0 or self.moe_gate_load_balance_coef != 0.0:
+                gate_weights = self._moe_gate_weights()
+                if gate_weights is not None:
+                    gate_weights = gate_weights[:original_batch_size]
+                    # Per-sample entropy: low = confident, near-one-hot routing.
+                    moe_gate_entropy = -(
+                        gate_weights * torch.log(gate_weights + 1e-8)
+                    ).sum(-1).mean()
+                    # Load balancing: squared coefficient of variation of per-expert
+                    # importance (summed gate mass) across the batch. Minimizing this
+                    # keeps usage spread across experts instead of collapsing onto one.
+                    importance = gate_weights.sum(dim=0)
+                    load_balance = importance.var() / (importance.mean() ** 2 + 1e-8)
+                    moe_gate_loss = (
+                        self.moe_gate_entropy_coef * moe_gate_entropy
+                        + self.moe_gate_load_balance_coef * load_balance
+                    )
+
             # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
             ppo_loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
+                + moe_gate_loss
             )
 
             # Mirror loss (only when it actually feeds the gradient; computing it
@@ -835,6 +879,7 @@ class AMP_PPO:
             mean_policy_pred += policy_d_prob.mean().item()
             mean_expert_pred += expert_d_prob.mean().item()
             mean_symmetry_loss += symmetry_loss_value.item()
+            mean_moe_gate_entropy += moe_gate_entropy.item()
 
             # Calculate the accuracy of the discriminator.
             mean_accuracy_policy += torch.sum(
@@ -860,6 +905,7 @@ class AMP_PPO:
         mean_accuracy_expert /= max(1, mean_accuracy_expert_elem)
         mean_kl_divergence /= num_updates
         mean_symmetry_loss /= num_updates
+        mean_moe_gate_entropy /= num_updates
 
         # Clear the storage for the next update cycle.
         self.storage.clear()
@@ -875,4 +921,5 @@ class AMP_PPO:
             mean_accuracy_expert,
             mean_kl_divergence,
             mean_symmetry_loss,
+            mean_moe_gate_entropy,
         )

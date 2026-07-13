@@ -525,6 +525,7 @@ class AMPOnPolicyRunner:
                 mean_accuracy_expert,
                 mean_kl_divergence,
                 mean_symmetry_loss,
+                mean_moe_gate_entropy,
             ) = self.alg.update()
             stop = time.time()
             learn_time = stop - start
@@ -618,6 +619,9 @@ class AMPOnPolicyRunner:
         )
         self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
         self.writer.add_scalar(
+            "Loss/moe_gate_entropy", locs["mean_moe_gate_entropy"], locs["it"]
+        )
+        self.writer.add_scalar(
             "Policy/mean_noise_std", mean_std_value.item(), locs["it"]
         )
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -668,6 +672,7 @@ class AMPOnPolicyRunner:
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
+                f"""{'MoE gate entropy:':>{pad}} {locs['mean_moe_gate_entropy']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
@@ -683,6 +688,7 @@ class AMPOnPolicyRunner:
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
+                f"""{'MoE gate entropy:':>{pad}} {locs['mean_moe_gate_entropy']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""

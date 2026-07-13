@@ -59,6 +59,13 @@ class ActorMoE(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
         self.softmax = nn.Softmax(dim=-1)  # kept separate for ONNX clarity
 
+        # Populated on every forward() with the gate's softmax weights, shape
+        # [batch, num_experts]. Used by AMP_PPO for optional gate regularization
+        # (entropy penalty / load-balancing loss) to encourage expert specialization.
+        # Kept with gradient attached (not detached) so those losses can backprop
+        # into the gate.
+        self.last_gate_weights: torch.Tensor | None = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -68,8 +75,9 @@ class ActorMoE(nn.Module):
         """
         expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
         gate_logits = self.gate(x)  # [batch, K]
-        weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
-        return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
+        weights = self.softmax(gate_logits)  # [batch, K]
+        self.last_gate_weights = weights
+        return (expert_out * weights.unsqueeze(1)).sum(-1)  # weighted sum -> [batch, A]
 
 
 class ActorCriticMoE(nn.Module):
@@ -162,6 +170,14 @@ class ActorCriticMoE(nn.Module):
 
         print(f"Actor (MoE) structure:\n{self.actor}")
         print(f"Critic MLP structure:\n{self.critic}")
+
+    @property
+    def moe_gate_weights(self):
+        """Softmax gate weights [batch, num_experts] from the most recent forward pass.
+
+        None if `self.actor` doesn't expose gate routing (e.g. it isn't an ActorMoE).
+        """
+        return getattr(self.actor, "last_gate_weights", None)
 
     def reset(self, dones=None):  # noqa: D401
         pass
