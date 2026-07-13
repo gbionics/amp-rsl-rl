@@ -273,6 +273,14 @@ class AMPLoader:
         simulation_dt: Timestep used by the simulator
         slow_down_factor: Integer factor to slow down original data
         expected_joint_names: (Optional) override for joint ordering
+        skill_names: (Optional) canonical ordered list of skill names, e.g.
+            ``["forward", "backward", "turn_in_place"]``. This is the single source
+            of truth for the skill one-hot layout and must be shared with the
+            environment. ``None`` (default) ⇒ ``num_skills = 0`` ⇒ current
+            unconditional behavior (no one-hot appended).
+        dataset_skills: (Optional) mapping each dataset/clip name (the keys of
+            ``datasets``) to a skill name in ``skill_names``. Required when
+            ``skill_names`` is provided.
     """
 
     def __init__(
@@ -285,6 +293,8 @@ class AMPLoader:
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        skill_names: Optional[List[str]] = None,
+        dataset_skills: Optional[Dict[str, str]] = None,
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
@@ -308,6 +318,33 @@ class AMPLoader:
         # ─── Parse dataset names and weights ───
         dataset_names = list(datasets.keys())
         dataset_weights = list(datasets.values())
+
+        # ─── Resolve skill configuration ───
+        # ``skill_names`` is the single source of truth for the one-hot layout.
+        # ``None`` ⇒ num_skills == 0 ⇒ no one-hot appended (backward compatible).
+        self.skill_names: Optional[List[str]] = (
+            list(skill_names) if skill_names is not None else None
+        )
+        self.num_skills = 0 if skill_names is None else len(skill_names)
+        self.dataset_skills = dataset_skills
+        if self.num_skills > 0:
+            if dataset_skills is None:
+                raise ValueError(
+                    "`dataset_skills` must be provided when `skill_names` is set."
+                )
+            skill_name_to_id = {name: i for i, name in enumerate(self.skill_names)}
+            for dataset_name in dataset_names:
+                if dataset_name not in dataset_skills:
+                    raise ValueError(
+                        f"Dataset '{dataset_name}' has no entry in `dataset_skills`. "
+                        f"Every dataset must be assigned a skill from {self.skill_names}."
+                    )
+                skill = dataset_skills[dataset_name]
+                if skill not in skill_name_to_id:
+                    raise ValueError(
+                        f"Dataset '{dataset_name}' is assigned unknown skill "
+                        f"'{skill}'. Known skills: {self.skill_names}."
+                    )
 
         # ─── Build union of all joint names if not provided ───
         if expected_joint_names is None:
@@ -343,12 +380,24 @@ class AMPLoader:
         obs_list, next_obs_list, reset_states = [], [], []
         augmented_lengths: List[int] = []
         original_lengths: List[int] = []
-        for data, w in zip(self.motion_data, self.dataset_weights):
+        for data, w, dataset_name in zip(
+            self.motion_data, self.dataset_weights, dataset_names
+        ):
             T = len(data)
             idx = torch.arange(T, device=self.device)
             obs = data.get_amp_dataset_obs(idx, self.velocity_representation)
             next_idx = torch.clamp(idx + 1, max=T - 1)
             next_obs = data.get_amp_dataset_obs(next_idx, self.velocity_representation)
+
+            # Append the clip's skill one-hot BEFORE symmetry augmentation, so the
+            # user's mirror function sees the same [*, D_aug] layout here that
+            # Discriminator.apply_symmetry hands it at training time.
+            if self.num_skills > 0:
+                k = skill_name_to_id[dataset_skills[dataset_name]]
+                onehot = torch.zeros((obs.shape[0], self.num_skills), device=self.device)
+                onehot[:, k] = 1.0
+                obs = torch.cat([obs, onehot], dim=-1)
+                next_obs = torch.cat([next_obs, onehot], dim=-1)
 
             if self.symmetry_cfg and self.symmetry_cfg.get(
                 "use_amp_dataset_augmentation", False
@@ -369,6 +418,10 @@ class AMPLoader:
         self.all_obs = torch.cat(obs_list, dim=0)
         self.all_next_obs = torch.cat(next_obs_list, dim=0)
         self.all_states = torch.cat(reset_states, dim=0)
+
+        # AMP observation widths (physical dims + skill one-hot).
+        self.amp_obs_dim = self.all_obs.shape[1]  # D_aug
+        self.amp_phys_dim = self.amp_obs_dim - self.num_skills  # D_phys
 
         # Build per-frame sampling weights for obs: weight_i / length_i
         per_frame = torch.cat(
@@ -394,6 +447,23 @@ class AMPLoader:
         obs: Optional[torch.Tensor],
         obs_type: Optional[Any] = None,
     ) -> Optional[torch.Tensor]:
+        """Apply the configured mirror augmentation to an AMP tensor.
+
+        Layout note (skill-conditioned loader)
+        --------------------------------------
+        When ``num_skills > 0`` the ``obs`` handed to the augmentation function is
+        ``[*, D_phys + K]``: the physical AMP observation followed by the skill
+        one-hot occupying the last ``K`` dimensions. This matches exactly the
+        layout that :meth:`Discriminator.apply_symmetry` produces at training
+        time, so a single mirror function serves both paths. The mirror function
+        must handle the one-hot tail explicitly:
+
+        - Chirally-symmetric skills (forward walk mirrors to forward walk,
+          backward to backward): pass the one-hot through unchanged.
+        - Chirally-paired skills (e.g. separate ``turn_left`` / ``turn_right``):
+          the mirror must permute those two one-hot entries. A single combined
+          ``turn_in_place`` skill passes through unchanged.
+        """
         if self.symmetry_cfg is None:
             return obs
 

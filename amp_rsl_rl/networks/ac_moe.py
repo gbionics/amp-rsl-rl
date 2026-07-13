@@ -41,6 +41,10 @@ class ActorMoE(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_experts = num_experts
+        # Read-only diagnostic: the most recent gate weights [B, num_experts].
+        # This is stored purely for observation (e.g. per-skill expert usage) and
+        # is never consumed by any loss or gradient.
+        self.last_gate_weights: torch.Tensor | None = None
         act = resolve_nn_activation(activation)
 
         # experts
@@ -69,6 +73,8 @@ class ActorMoE(nn.Module):
         expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
         gate_logits = self.gate(x)  # [batch, K]
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
+        # Store gate weights [B, num_experts] for diagnostics only (no gradient use).
+        self.last_gate_weights = weights.detach().squeeze(1)
         return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
 
 
@@ -168,6 +174,16 @@ class ActorCriticMoE(nn.Module):
 
     def forward(self):
         raise NotImplementedError
+
+    @property
+    def moe_gate_weights(self) -> torch.Tensor | None:
+        """Most recent MoE gate weights ``[B, num_experts]`` (diagnostic only).
+
+        Returns ``None`` before the actor has been evaluated. This exposes
+        :attr:`ActorMoE.last_gate_weights` for read-only logging of per-skill
+        expert usage; it is never consumed by any loss.
+        """
+        return self.actor.last_gate_weights
 
     @property
     def action_mean(self):

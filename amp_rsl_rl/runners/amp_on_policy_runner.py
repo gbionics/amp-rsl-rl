@@ -292,8 +292,14 @@ class AMPOnPolicyRunner:
             )
         simulation_dt = self.env.cfg.sim.dt * self.env.cfg.decimation
 
+        # ─── Resolve skill (command-conditioning) configuration ───
+        self.skill_names = self.dataset_cfg.get("skill_names", None)
+        self.dataset_skills = self.dataset_cfg.get("dataset_skills", None)
+        self.skill_obs_group = self.dataset_cfg.get("skill_obs_group", "skill")
+        self.num_skills = 0 if self.skill_names is None else len(self.skill_names)
+
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
-        num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
+        num_amp_obs = self._build_amp_obs(observations).shape[1]
 
         # Resolve velocity representation for discriminator observations
         vel_repr_str = self.dataset_cfg.get("velocity_representation", "body_fixed")
@@ -308,6 +314,19 @@ class AMPOnPolicyRunner:
             expected_joint_names=amp_joint_names,
             velocity_representation=velocity_representation,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            skill_names=self.skill_names,
+            dataset_skills=self.dataset_skills,
+        )
+
+        # Validate the env/dataset AMP observation contract loudly at construction.
+        # A silent mismatch (e.g. env one-hot ordered differently from
+        # skill_names) would train every head on the wrong data while looking
+        # perfectly healthy.
+        assert num_amp_obs == amp_data.all_obs.shape[1], (
+            f"AMP obs width mismatch: env produces {num_amp_obs}, dataset produces "
+            f"{amp_data.all_obs.shape[1]}. Check that the env's "
+            f"'{self.skill_obs_group}' group is a {self.num_skills}-dim one-hot "
+            f"ordered as {self.skill_names}."
         )
 
         self.discriminator = Discriminator(
@@ -319,6 +338,7 @@ class AMPOnPolicyRunner:
             loss_type=self.discriminator_cfg["loss_type"],
             empirical_normalization=self.discriminator_cfg["empirical_normalization"],
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            num_skills=self.num_skills,
         ).to(self.device)
 
         # Initialize the PPO algorithm
@@ -387,6 +407,27 @@ class AMPOnPolicyRunner:
             return torch.cat([amp_obs[k] for k in keys], dim=-1)
         raise TypeError(f"Unsupported AMP observation type: {type(amp_obs)}")
 
+    def _build_amp_obs(self, obs) -> torch.Tensor:
+        """Build the AMP observation, appending the skill one-hot when enabled.
+
+        Returns the flattened physical AMP observation unchanged when
+        ``num_skills == 0`` (backward compatible), otherwise concatenates the
+        environment's skill one-hot group (ordered as ``skill_names``).
+        """
+        phys = self._flatten_amp_obs(obs["amp"])
+        if self.num_skills == 0:
+            return phys
+        return torch.cat([phys, obs[self.skill_obs_group]], dim=-1)
+
+    def _get_moe_gate_weights(self) -> torch.Tensor | None:
+        """Return the actor's most recent MoE gate weights, or ``None``.
+
+        Read-only diagnostic accessor: returns ``[B, num_experts]`` if the actor
+        is a Mixture-of-Experts policy that has been evaluated, else ``None``.
+        """
+        module = self.alg.actor if RSL_RL_V4_PLUS else self.alg.actor_critic
+        return getattr(module, "moe_gate_weights", None)
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
@@ -433,7 +474,7 @@ class AMPOnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs = self.env.get_observations().to(self.device)
-        amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+        amp_obs = self._build_amp_obs(obs).clone()
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -458,9 +499,39 @@ class AMPOnPolicyRunner:
             mean_style_reward_log = torch.zeros((), device=self.device)
             mean_task_reward_log = torch.zeros((), device=self.device)
 
+            # Per-skill diagnostics, accumulated on-device (a single .item()/
+            # .tolist() sync is performed once per iteration, after the rollout).
+            if self.num_skills > 0:
+                style_reward_sum_per_skill = torch.zeros(
+                    self.num_skills, device=self.device
+                )
+                style_count_per_skill = torch.zeros(
+                    self.num_skills, device=self.device
+                )
+                gate_sum_per_skill = None
+                gate_count_per_skill = torch.zeros(
+                    self.num_skills, device=self.device
+                )
+
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs)
+
+                    # Read-only MoE gate diagnostic: accumulate mean gate weight
+                    # per commanded skill (skill_onehot.T @ gate_weights).
+                    if self.num_skills > 0:
+                        gate_w = self._get_moe_gate_weights()
+                        if gate_w is not None:
+                            cmd_onehot = obs[self.skill_obs_group]  # [B, K]
+                            if gate_sum_per_skill is None:
+                                gate_sum_per_skill = torch.zeros(
+                                    self.num_skills,
+                                    gate_w.shape[-1],
+                                    device=self.device,
+                                )
+                            gate_sum_per_skill += cmd_onehot.t() @ gate_w
+                            gate_count_per_skill += cmd_onehot.sum(0)
+
                     self.alg.act_amp(amp_obs)
                     obs, rewards, dones, extras = self.env.step(
                         actions.to(self.env.device)
@@ -469,13 +540,23 @@ class AMPOnPolicyRunner:
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
 
-                    next_amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+                    next_amp_obs = self._build_amp_obs(obs).clone()
                     style_rewards = self.discriminator.predict_reward(
                         amp_obs, next_amp_obs
                     )
 
                     mean_task_reward_log += rewards.mean()
                     mean_style_reward_log += style_rewards.mean()
+
+                    # Accumulate style reward per commanded skill. The command at
+                    # time t is carried in amp_obs' one-hot tail, which is exactly
+                    # the head that scored this transition.
+                    if self.num_skills > 0:
+                        cmd_onehot = amp_obs[..., -self.num_skills :]
+                        style_reward_sum_per_skill += (
+                            cmd_onehot * style_rewards.unsqueeze(-1)
+                        ).sum(0)
+                        style_count_per_skill += cmd_onehot.sum(0)
 
                     rewards = (
                         1 - self.style_weight
@@ -513,6 +594,33 @@ class AMPOnPolicyRunner:
             # Single synchronization point for the whole rollout.
             mean_style_reward_log = mean_style_reward_log.item() / self.num_steps_per_env
             mean_task_reward_log = mean_task_reward_log.item() / self.num_steps_per_env
+
+            # Per-skill diagnostics: reduce to python floats once per iteration.
+            style_reward_per_skill = {}
+            moe_gate_per_skill = {}
+            if self.num_skills > 0:
+                per_skill_mean = (
+                    style_reward_sum_per_skill
+                    / style_count_per_skill.clamp(min=1.0)
+                ).tolist()
+                style_counts = style_count_per_skill.tolist()
+                for i, name in enumerate(self.skill_names):
+                    if style_counts[i] > 0:
+                        style_reward_per_skill[name] = per_skill_mean[i]
+
+                if gate_sum_per_skill is not None:
+                    gate_mean = (
+                        gate_sum_per_skill
+                        / gate_count_per_skill.clamp(min=1.0).unsqueeze(-1)
+                    ).tolist()
+                    gate_counts = gate_count_per_skill.tolist()
+                    num_experts = gate_sum_per_skill.shape[-1]
+                    for k, name in enumerate(self.skill_names):
+                        if gate_counts[k] > 0:
+                            for e in range(num_experts):
+                                moe_gate_per_skill[f"gate_e{e}_skill_{name}"] = (
+                                    gate_mean[k][e]
+                                )
 
             (
                 mean_value_loss,
@@ -642,6 +750,15 @@ class AMPOnPolicyRunner:
             self.writer.add_scalar(
                 "Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"]
             )
+            # Per-skill style reward — the key signal that the discriminator is
+            # producing a genuinely different reward landscape per command.
+            for skill_name, value in locs.get("style_reward_per_skill", {}).items():
+                self.writer.add_scalar(
+                    f"Train/style_reward_{skill_name}", value, locs["it"]
+                )
+            # Read-only MoE gate diagnostic: mean gate weight per expert per skill.
+            for key, value in locs.get("moe_gate_per_skill", {}).items():
+                self.writer.add_scalar(f"MoE/{key}", value, locs["it"])
             if self.logger_type not in (
                 "wandb",
                 "mlflow",

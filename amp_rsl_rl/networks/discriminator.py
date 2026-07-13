@@ -35,6 +35,11 @@ class Discriminator(nn.Module):
         eta_wgan (float): Scaling factor for the Wasserstein loss (if used).
         use_minibatch_std (bool): Whether to use minibatch standard deviation in the network
         empirical_normalization (bool): Whether to normalize AMP observations empirically before scoring.
+        num_skills (int): Number of commanded skills. ``0`` (default) restores the
+            original unconditional single-head discriminator. When ``> 0`` the AMP
+            observation is expected to carry a skill one-hot in its last
+            ``num_skills`` dimensions, and the network becomes a shared trunk with
+            ``num_skills`` linear heads (one per skill).
     """
 
     def __init__(
@@ -49,15 +54,24 @@ class Discriminator(nn.Module):
         use_minibatch_std: bool = True,
         empirical_normalization: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        num_skills: int = 0,
     ):
         super().__init__()
 
         self.device = torch.device(device)
+        # ``input_dim`` keeps meaning ``2 * D_aug`` (state + next_state, each
+        # carrying the skill one-hot). AMP_PPO reads it to size the replay buffer,
+        # so its meaning must NOT change.
         self.input_dim = input_dim
+        self.num_skills = num_skills
+        self.obs_dim = input_dim // 2  # D_aug (physical dims + skill one-hot)
+        self.phys_dim = self.obs_dim - num_skills  # D_phys (physical dims only)
         self.reward_scale = reward_scale
         self.reward_clamp_epsilon = reward_clamp_epsilon
         layers = []
-        curr_in_dim = input_dim
+        # The skill one-hot never enters the trunk: only the physical dims of both
+        # the current and next observation do.
+        curr_in_dim = 2 * self.phys_dim
 
         for hidden_dim in hidden_layer_sizes:
             layers.append(nn.Linear(curr_in_dim, hidden_dim))
@@ -66,12 +80,13 @@ class Discriminator(nn.Module):
 
         self.trunk = nn.Sequential(*layers)
         final_in_dim = hidden_layer_sizes[-1] + (1 if use_minibatch_std else 0)
-        self.linear = nn.Linear(final_in_dim, 1)
+        # Shared trunk + K linear heads (a single head when num_skills == 0).
+        self.linear = nn.Linear(final_in_dim, max(1, num_skills))
 
         self.empirical_normalization = empirical_normalization
-        amp_obs_dim = input_dim // 2
+        # Never normalize the one-hot dims: the normalizer operates on D_phys only.
         if empirical_normalization:
-            self.amp_normalizer = EmpiricalNormalization(shape=[amp_obs_dim])
+            self.amp_normalizer = EmpiricalNormalization(shape=[self.phys_dim])
         else:
             self.amp_normalizer = nn.Identity()
 
@@ -106,6 +121,27 @@ class Discriminator(nn.Module):
     def apply_symmetry(
         self, tensor: torch.Tensor, obs_type: str = "amp"
     ) -> torch.Tensor:
+        """Apply the configured symmetry (mirror) augmentation to an AMP tensor.
+
+        Layout note (skill-conditioned discriminator)
+        ----------------------------------------------
+        When ``num_skills > 0`` the tensor handed to the augmentation function is
+        ``[*, D_phys + K]``: the physical AMP observation followed by the skill
+        one-hot occupying the last ``K`` dimensions. This is exactly the same
+        layout that :meth:`AMPLoader._apply_symmetry` sees at dataset-build time,
+        so a single mirror function serves both paths. The mirror function must
+        handle the one-hot tail explicitly:
+
+        - Chirally-symmetric skills (forward walk mirrors to forward walk,
+          backward to backward): pass the one-hot through unchanged.
+        - Chirally-paired skills (e.g. separate ``turn_left`` / ``turn_right``):
+          the mirror must permute those two one-hot entries, because a mirrored
+          left turn is a right turn. A single combined ``turn_in_place`` skill
+          passes through unchanged.
+
+        Getting this wrong silently trains heads on mirrored data belonging to the
+        wrong skill.
+        """
         if self.symmetry_cfg is None or not self.symmetry_cfg.get(
             "use_data_augmentation", False
         ):
@@ -125,24 +161,36 @@ class Discriminator(nn.Module):
         """Forward pass through the discriminator.
 
         Args:
-            x (Tensor): Input tensor (batch_size, input_dim).
+            x (Tensor): Input tensor ``[batch, 2 * D_aug]`` (state + next_state,
+                each carrying its skill one-hot when ``num_skills > 0``).
 
         Returns:
-            Tensor: Discriminator output logits/scores.
+            Tensor: Discriminator output logits ``[batch, 1]``. When
+                ``num_skills > 0`` the logit is taken from the head selected by
+                the **current state's** skill one-hot; ``next_state``'s skill dims
+                are ignored.
         """
 
-        # Normalize AMP observations. If not enabled the normalizer is identity.
-        # split state and next_state and apply normalization
-        state, next_state = torch.split(x, self.input_dim // 2, dim=-1)
-        state = self.amp_normalizer(state)
-        next_state = self.amp_normalizer(next_state)
-        x = torch.cat([state, next_state], dim=-1)
+        # Split state and next_state. Only the physical dims are normalized and
+        # fed to the trunk; the one-hot never enters the network.
+        state, next_state = torch.split(x, self.obs_dim, dim=-1)
 
-        h = self.trunk(x)
+        s_phys = state[..., : self.phys_dim]
+        ns_phys = next_state[..., : self.phys_dim]
+
+        s_phys = self.amp_normalizer(s_phys)
+        ns_phys = self.amp_normalizer(ns_phys)
+
+        h = self.trunk(torch.cat([s_phys, ns_phys], dim=-1))
         if self.use_minibatch_std:
             s = self._minibatch_std_scalar(h)
             h = torch.cat([h, s], dim=-1)
-        return self.linear(h)
+
+        logits = self.linear(h)  # [B, K] (or [B, 1] when num_skills == 0)
+        if self.num_skills > 0:
+            skill_idx = state[..., self.phys_dim :].argmax(dim=-1, keepdim=True)
+            logits = logits.gather(1, skill_idx)  # [B, 1]
+        return logits
 
     def _minibatch_std_scalar(self, h: torch.Tensor) -> torch.Tensor:
         """Mean over feature-wise std across the batch; shape (B,1)."""
@@ -215,12 +263,17 @@ class Discriminator(nn.Module):
         return self.loss_fun(discriminator_output, expected)
 
     def update_normalization(self, *batches: torch.Tensor) -> None:
-        """Update empirical statistics using provided AMP batches."""
+        """Update empirical statistics using provided AMP batches.
+
+        Each batch is a full ``[B, D_aug]`` observation; only the physical dims
+        (the first ``D_phys`` columns) are used to update the normalizer. The
+        skill one-hot is a near-constant channel and must never be normalized.
+        """
         if not self.empirical_normalization:
             return
         with torch.no_grad():
             for batch in batches:
-                self.amp_normalizer.update(batch)
+                self.amp_normalizer.update(batch[..., : self.phys_dim])
 
     def compute_loss(
         self,
@@ -231,9 +284,11 @@ class Discriminator(nn.Module):
         lambda_: float = 10,
     ):
 
-        # Compute gradient penalty to stabilize discriminator training.
-        sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
-        sample_amp_policy = tuple(self.amp_normalizer(s) for s in sample_amp_policy)
+        # ``policy_d`` / ``expert_d`` arrive already head-selected as [B, 1], so
+        # the BCE terms are unchanged. ``sample_amp_*`` are full [B, D_aug]
+        # tuples (state, next_state); the gradient penalty slices off the skill
+        # one-hot, normalizes only the physical dims and selects the correct head
+        # internally, so we pass the raw tuples straight through.
         grad_pen_loss = self.compute_grad_pen(
             expert_states=sample_amp_expert,
             policy_states=sample_amp_policy,
@@ -257,17 +312,31 @@ class Discriminator(nn.Module):
         """Computes the gradient penalty used to regularize the discriminator.
 
         Args:
-            expert_states (tuple[Tensor, Tensor]): A tuple containing batches of expert states and expert next states.
-            policy_states (tuple[Tensor, Tensor]): A tuple containing batches of policy states and policy next states.
+            expert_states (tuple[Tensor, Tensor]): A tuple containing batches of
+                expert states and expert next states, each ``[B, D_aug]``.
+            policy_states (tuple[Tensor, Tensor]): A tuple containing batches of
+                policy states and policy next states, each ``[B, D_aug]``.
             lambda_ (float): Penalty coefficient.
 
         Returns:
             Tensor: Gradient penalty value.
-        """
-        expert = torch.cat(expert_states, -1)
 
+        Notes:
+            When ``num_skills > 0`` the gradient is taken w.r.t. the physical dims
+            only (the gradient of a score w.r.t. a one-hot input is meaningless),
+            and the head is selected from the **expert's** skill one-hot.
+        """
         if self.loss_type == "Wasserstein":
-            policy = torch.cat(policy_states, -1)
+            if self.num_skills > 0:
+                raise NotImplementedError(
+                    "Gradient penalty for the Wasserstein loss is not supported "
+                    "when num_skills > 0: interpolating skill one-hots between an "
+                    "expert sample of one skill and a policy sample of another is "
+                    "ill-defined. Use loss_type='BCEWithLogits' for skill-"
+                    "conditioned training."
+                )
+            expert = torch.cat([self.amp_normalizer(s) for s in expert_states], -1)
+            policy = torch.cat([self.amp_normalizer(s) for s in policy_states], -1)
             alpha = torch.rand(expert.size(0), 1, device=expert.device)
             alpha = alpha.expand_as(expert)
             data = alpha * expert + (1 - alpha) * policy
@@ -288,8 +357,19 @@ class Discriminator(nn.Module):
             )[0]
             return lambda_ * (grad.norm(2, dim=1) - 1.0).pow(2).mean()
         elif self.loss_type == "BCEWithLogits":
-            # R1 regularizer on REAL: 0.5 * lambda * ||∇_x D(x_real)||^2
-            data = expert.detach().requires_grad_(True)
+            expert_state, expert_next_state = expert_states
+            # Slice off the skill one-hot and normalize only the physical dims.
+            expert_s_phys = self.amp_normalizer(expert_state[..., : self.phys_dim])
+            expert_ns_phys = self.amp_normalizer(
+                expert_next_state[..., : self.phys_dim]
+            )
+            # R1 regularizer on REAL: 0.5 * lambda * ||∇_x D(x_real)||^2, where x
+            # is the physical dims only.
+            data = (
+                torch.cat([expert_s_phys, expert_ns_phys], dim=-1)
+                .detach()
+                .requires_grad_(True)
+            )
             # Compute D(x_real) with minibatch-std DETACHED,
             # so gradients are w.r.t. the sample itself, not the batch statistics.
             h = self.trunk(data)
@@ -297,7 +377,14 @@ class Discriminator(nn.Module):
                 with torch.no_grad():
                     s = self._minibatch_std_scalar(h)
                 h = torch.cat([h, s], dim=-1)
-            scores = self.linear(h)
+            logits = self.linear(h)
+            if self.num_skills > 0:
+                skill_idx = expert_state[..., self.phys_dim :].argmax(
+                    dim=-1, keepdim=True
+                )
+                scores = logits.gather(1, skill_idx)
+            else:
+                scores = logits
 
             grad = autograd.grad(
                 outputs=scores.sum(),
