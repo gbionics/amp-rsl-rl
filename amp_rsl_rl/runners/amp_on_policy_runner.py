@@ -21,7 +21,7 @@ import rsl_rl
 from rsl_rl.env import VecEnv
 
 import amp_rsl_rl
-from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation
+from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation, QuaternionConvention
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
 from amp_rsl_rl.utils import export_policy_as_onnx
@@ -119,6 +119,10 @@ class AMPOnPolicyRunner:
         * "slow_down_factor": slowdown applied to real motion data to match sim dynamics
         * "velocity_representation": (optional) "body_fixed" or "mixed" — frame convention
           for base velocities in discriminator observations. Default: "body_fixed"
+        * "quaternion_convention": (optional) "wxyz" or "xyzw" — serialization convention
+          for the base orientation quaternion returned for env resets. Default: "wxyz"
+          (historical IsaacLab/Isaac Gym convention). Use "xyzw" for newer IsaacLab
+          versions that expect scalar-last quaternions.
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
     - "empirical_normalization": (deprecated) legacy flag mirrored to `policy.actor_obs_normalization`
@@ -136,7 +140,9 @@ class AMPOnPolicyRunner:
     - `"fps"`: float — original dataset frame rate
 
     Internally:
-    - Quaternions are interpolated via SLERP and converted to **`wxyz`** format before being used by the model (to match Isaac Gym convention).
+    - Quaternions are interpolated via SLERP and converted to the format specified by
+      `dataset.quaternion_convention` (defaults to **`wxyz`**, to match the historical Isaac Gym /
+      IsaacLab convention) before being used by the model.
     - Velocities are estimated with finite differences.
     - All data is converted to torch tensors and placed on the desired device.
 
@@ -299,6 +305,10 @@ class AMPOnPolicyRunner:
         vel_repr_str = self.dataset_cfg.get("velocity_representation", "body_fixed")
         velocity_representation = VelocityRepresentation(vel_repr_str)
 
+        # Resolve quaternion serialization convention for env reset states
+        quat_convention_str = self.dataset_cfg.get("quaternion_convention", "wxyz")
+        quaternion_convention = QuaternionConvention(quat_convention_str)
+
         amp_data = AMPLoader(
             device=self.device,
             dataset_path_root=self.dataset_cfg["amp_data_path"],
@@ -307,6 +317,7 @@ class AMPOnPolicyRunner:
             slow_down_factor=self.dataset_cfg["slow_down_factor"],
             expected_joint_names=amp_joint_names,
             velocity_representation=velocity_representation,
+            quaternion_convention=quaternion_convention,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
         )
 
