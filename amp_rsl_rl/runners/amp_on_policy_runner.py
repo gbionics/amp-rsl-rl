@@ -299,6 +299,13 @@ class AMPOnPolicyRunner:
         vel_repr_str = self.dataset_cfg.get("velocity_representation", "body_fixed")
         velocity_representation = VelocityRepresentation(vel_repr_str)
 
+        # Optional per-skill grouping of the datasets. When provided, the loader
+        # builds per-skill sampling buffers and we create one discriminator per
+        # skill so each expert of the MoE actor specialises in a single skill.
+        skills = self.dataset_cfg.get("skills", None)
+        self.skill_names = list(skills.keys()) if skills else ["default"]
+        self.num_skills = len(self.skill_names)
+
         amp_data = AMPLoader(
             device=self.device,
             dataset_path_root=self.dataset_cfg["amp_data_path"],
@@ -308,18 +315,27 @@ class AMPOnPolicyRunner:
             expected_joint_names=amp_joint_names,
             velocity_representation=velocity_representation,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            skills=skills,
         )
 
-        self.discriminator = Discriminator(
-            input_dim=num_amp_obs
-            * 2,  # the discriminator takes in the concatenation of the current and next observation
-            hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
-            reward_scale=self.discriminator_cfg["reward_scale"],
-            device=self.device,
-            loss_type=self.discriminator_cfg["loss_type"],
-            empirical_normalization=self.discriminator_cfg["empirical_normalization"],
-            symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
-        ).to(self.device)
+        # Build one discriminator per skill (a single one when no skills given).
+        self.discriminators = [
+            Discriminator(
+                input_dim=num_amp_obs
+                * 2,  # the discriminator takes in the concatenation of the current and next observation
+                hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
+                reward_scale=self.discriminator_cfg["reward_scale"],
+                device=self.device,
+                loss_type=self.discriminator_cfg["loss_type"],
+                empirical_normalization=self.discriminator_cfg[
+                    "empirical_normalization"
+                ],
+                symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            ).to(self.device)
+            for _ in range(self.num_skills)
+        ]
+        # Backwards-compatible alias to the first (or only) discriminator.
+        self.discriminator = self.discriminators[0]
 
         # Initialize the PPO algorithm
         alg_class = resolve_class(self.alg_cfg.pop("class_name"))
@@ -336,7 +352,7 @@ class AMPOnPolicyRunner:
             self.alg: AMP_PPO = alg_class(
                 actor=actor,
                 critic=critic,
-                discriminator=self.discriminator,
+                discriminators=self.discriminators,
                 amp_data=amp_data,
                 device=self.device,
                 **self.alg_cfg,
@@ -344,7 +360,7 @@ class AMPOnPolicyRunner:
         else:
             self.alg: AMP_PPO = alg_class(
                 actor_critic=actor_critic,
-                discriminator=self.discriminator,
+                discriminators=self.discriminators,
                 amp_data=amp_data,
                 device=self.device,
                 **self.alg_cfg,
@@ -386,6 +402,38 @@ class AMPOnPolicyRunner:
             keys = sorted(amp_obs.keys())
             return torch.cat([amp_obs[k] for k in keys], dim=-1)
         raise TypeError(f"Unsupported AMP observation type: {type(amp_obs)}")
+
+    def _extract_skill_ids(self, obs) -> torch.Tensor | None:
+        """Return per-environment integer skill labels from the observations.
+
+        The environment is expected to publish a ``"skill"`` observation group
+        (shape ``[num_envs, 1]``) whose value indexes which skill (and therefore
+        which discriminator/expert) is active for each environment. Returns
+        ``None`` when running single-skill or when the env does not expose it.
+        """
+        if self.num_skills == 1 or "skill" not in obs.keys():
+            return None
+        return obs["skill"].reshape(-1).long().to(self.device)
+
+    def _predict_style_reward(
+        self,
+        amp_obs: torch.Tensor,
+        next_amp_obs: torch.Tensor,
+        skill_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compute the AMP style reward routing each env to its skill discriminator."""
+        if self.num_skills == 1 or skill_ids is None:
+            return self.discriminators[0].predict_reward(amp_obs, next_amp_obs)
+
+        style_rewards = torch.zeros(amp_obs.shape[0], device=self.device)
+        for skill_id in range(self.num_skills):
+            mask = skill_ids == skill_id
+            if bool(mask.any()):
+                r = self.discriminators[skill_id].predict_reward(
+                    amp_obs[mask], next_amp_obs[mask]
+                )
+                style_rewards[mask] = r.reshape(-1)
+        return style_rewards
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -434,6 +482,7 @@ class AMPOnPolicyRunner:
             )
         obs = self.env.get_observations().to(self.device)
         amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+        skill_ids = self._extract_skill_ids(obs)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -461,7 +510,7 @@ class AMPOnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs)
-                    self.alg.act_amp(amp_obs)
+                    self.alg.act_amp(amp_obs, skill_ids)
                     obs, rewards, dones, extras = self.env.step(
                         actions.to(self.env.device)
                     )
@@ -470,8 +519,8 @@ class AMPOnPolicyRunner:
                     dones = dones.to(self.device)
 
                     next_amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
-                    style_rewards = self.discriminator.predict_reward(
-                        amp_obs, next_amp_obs
+                    style_rewards = self._predict_style_reward(
+                        amp_obs, next_amp_obs, skill_ids
                     )
 
                     mean_task_reward_log += rewards.mean()
@@ -485,6 +534,7 @@ class AMPOnPolicyRunner:
                     self.alg.process_amp_step(next_amp_obs)
 
                     amp_obs = next_amp_obs
+                    skill_ids = self._extract_skill_ids(obs)
 
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -618,6 +668,9 @@ class AMPOnPolicyRunner:
         )
         self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
         self.writer.add_scalar(
+            "Loss/gate_supervision", getattr(self.alg, "mean_gate_loss", 0.0), locs["it"]
+        )
+        self.writer.add_scalar(
             "Policy/mean_noise_std", mean_std_value.item(), locs["it"]
         )
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -729,6 +782,9 @@ class AMPOnPolicyRunner:
                 "critic_state_dict": self.alg.critic.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer.state_dict(),
                 "discriminator_state_dict": self.alg.discriminator.state_dict(),
+                "discriminators_state_dict": [
+                    d.state_dict() for d in self.alg.discriminators
+                ],
                 "iter": self.current_learning_iteration,
                 "infos": infos,
             }
@@ -737,6 +793,9 @@ class AMPOnPolicyRunner:
                 "model_state_dict": self.alg.actor_critic.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer.state_dict(),
                 "discriminator_state_dict": self.alg.discriminator.state_dict(),
+                "discriminators_state_dict": [
+                    d.state_dict() for d in self.alg.discriminators
+                ],
                 "iter": self.current_learning_iteration,
                 "infos": infos,
             }
@@ -819,8 +878,18 @@ class AMPOnPolicyRunner:
                 self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
 
         if do_load_discriminator and "discriminator_state_dict" in loaded_dict:
-            discriminator_state = loaded_dict["discriminator_state_dict"]
-            self.alg.discriminator.load_state_dict(discriminator_state, strict=False)
+            discriminators_state = loaded_dict.get("discriminators_state_dict")
+            if discriminators_state is not None and len(discriminators_state) == len(
+                self.alg.discriminators
+            ):
+                for disc, state in zip(self.alg.discriminators, discriminators_state):
+                    disc.load_state_dict(state, strict=False)
+            else:
+                # Backward-compatible: single discriminator checkpoint. Load it
+                # into every skill discriminator as a shared initialisation.
+                discriminator_state = loaded_dict["discriminator_state_dict"]
+                for disc in self.alg.discriminators:
+                    disc.load_state_dict(discriminator_state, strict=False)
 
         amp_normalizer_module = loaded_dict.get("amp_normalizer")
         if (
@@ -855,7 +924,8 @@ class AMPOnPolicyRunner:
             self.alg.critic.train()
         else:
             self.alg.actor_critic.train()
-        self.alg.discriminator.train()
+        for disc in self.alg.discriminators:
+            disc.train()
 
     def eval_mode(self):
         if RSL_RL_V4_PLUS:
@@ -863,7 +933,8 @@ class AMPOnPolicyRunner:
             self.alg.critic.eval()
         else:
             self.alg.actor_critic.eval()
-        self.alg.discriminator.eval()
+        for disc in self.alg.discriminators:
+            disc.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)

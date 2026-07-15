@@ -71,6 +71,16 @@ class ActorMoE(nn.Module):
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
         return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
 
+    def gate_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the raw gating logits (pre-softmax) for each expert.
+
+        Args:
+            x: [batch, obs_dim]
+        Returns:
+            gate logits: [batch, num_experts]
+        """
+        return self.gate(x)
+
 
 class ActorCriticMoE(nn.Module):
     """Actor-critic module powered by a Mixture-of-Experts policy network.
@@ -207,6 +217,22 @@ class ActorCriticMoE(nn.Module):
         critic_obs = self.get_critic_obs(obs)
         critic_obs = self.critic_obs_normalizer(critic_obs)
         return self.critic(critic_obs)
+
+    @property
+    def num_experts(self) -> int:
+        return self.actor.num_experts
+
+    def get_gate_logits(self, obs):
+        """Compute the gating logits used to weight the experts for ``obs``.
+
+        The observations are grouped/normalised exactly like in :meth:`act` so
+        that the returned logits are consistent with the ones used during action
+        selection. Used by :class:`AMP_PPO` to supervise the gate so that each
+        expert specialises in a specific skill.
+        """
+        actor_obs = self.get_actor_obs(obs)
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        return self.actor.gate_logits(actor_obs)
 
     def get_actor_obs(self, obs):
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]

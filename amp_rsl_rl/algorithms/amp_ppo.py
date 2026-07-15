@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Dict, Any, Union, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tensordict import TensorDict
 
@@ -78,8 +79,8 @@ class AMP_PPO:
 
     def __init__(
         self,
-        discriminator: Discriminator,
-        amp_data: AMPLoader,
+        discriminator: Discriminator = None,
+        amp_data: AMPLoader = None,
         actor_critic=None,
         actor=None,
         critic=None,
@@ -100,6 +101,8 @@ class AMP_PPO:
         normalize_advantage_per_mini_batch: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
+        discriminators: Optional[Sequence[Discriminator]] = None,
+        gate_loss_coef: float = 0.0,
     ) -> None:
         # Set device and learning hyperparameters
         self.device: str = device
@@ -109,6 +112,7 @@ class AMP_PPO:
         self.normalize_advantage_per_mini_batch: bool = (
             normalize_advantage_per_mini_batch
         )
+        self.gate_loss_coef: float = gate_loss_coef
 
         if RSL_RL_V4_PLUS:
             if actor is None or critic is None:
@@ -128,15 +132,41 @@ class AMP_PPO:
             self.actor = self.actor_critic
             self.critic = None
 
-        # Set up the discriminator and move it to the appropriate device.
-        self.discriminator: Discriminator = discriminator.to(self.device)
+        # Set up the discriminator(s) and move them to the appropriate device.
+        # ``discriminators`` (a per-skill list) takes precedence over the legacy
+        # single ``discriminator`` argument. Internally everything is stored as a
+        # list so that the single-skill case is just ``num_skills == 1``.
+        if discriminators is not None:
+            disc_list = list(discriminators)
+        elif discriminator is not None:
+            disc_list = [discriminator]
+        else:
+            raise ValueError(
+                "AMP_PPO requires either 'discriminator' or 'discriminators'."
+            )
+        self.discriminators: nn.ModuleList = nn.ModuleList(
+            [d.to(self.device) for d in disc_list]
+        )
+        self.num_skills: int = len(self.discriminators)
+        # Backwards-compatible alias for code/checkpoints that expect a single one.
+        self.discriminator: Discriminator = self.discriminators[0]
+        # Per-env skill labels for the most recent AMP transition (set by act_amp).
+        self._amp_skill_ids: Optional[torch.Tensor] = None
+        # Populated at the end of each update() for logging.
+        self.mean_gate_loss: float = 0.0
+
         self.amp_transition: RolloutStorage.Transition = RolloutStorage.Transition()
         # Determine observation dimension used in the replay buffer.
         # The discriminator expects concatenated observations, so the replay buffer uses half the dimension.
-        obs_dim: int = self.discriminator.input_dim // 2
-        self.amp_storage: ReplayBuffer = ReplayBuffer(
-            obs_dim=obs_dim, buffer_size=amp_replay_buffer_size, device=device
-        )
+        obs_dim: int = self.discriminators[0].input_dim // 2
+        # One replay buffer per skill so each discriminator is trained only on the
+        # policy transitions generated while the corresponding skill was active.
+        self.amp_storage: list[ReplayBuffer] = [
+            ReplayBuffer(
+                obs_dim=obs_dim, buffer_size=amp_replay_buffer_size, device=device
+            )
+            for _ in range(self.num_skills)
+        ]
         self.amp_data: AMPLoader = amp_data
         self.storage: Optional[RolloutStorage] = (
             None  # Will be initialized later once environment parameters are known
@@ -144,34 +174,32 @@ class AMP_PPO:
 
         # Create optimizer for both the actor-critic and the discriminator.
         # Note: Weight decay is set differently for discriminator trunk and head.
+        disc_params = []
+        for skill_id, disc in enumerate(self.discriminators):
+            disc_params.append(
+                {
+                    "params": disc.trunk.parameters(),
+                    "weight_decay": 10e-4,
+                    "name": f"amp_trunk_{skill_id}",
+                }
+            )
+            disc_params.append(
+                {
+                    "params": disc.linear.parameters(),
+                    "weight_decay": 10e-2,
+                    "name": f"amp_head_{skill_id}",
+                }
+            )
         if RSL_RL_V4_PLUS:
             params = [
                 {"params": self.actor.parameters(), "name": "actor"},
                 {"params": self.critic.parameters(), "name": "critic"},
-                {
-                    "params": self.discriminator.trunk.parameters(),
-                    "weight_decay": 10e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": self.discriminator.linear.parameters(),
-                    "weight_decay": 10e-2,
-                    "name": "amp_head",
-                },
+                *disc_params,
             ]
         else:
             params = [
                 {"params": self.actor_critic.parameters(), "name": "actor_critic"},
-                {
-                    "params": self.discriminator.trunk.parameters(),
-                    "weight_decay": 10e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": self.discriminator.linear.parameters(),
-                    "weight_decay": 10e-2,
-                    "name": "amp_head",
-                },
+                *disc_params,
             ]
         self.optimizer: optim.Adam = optim.Adam(params, lr=learning_rate)
         self.transition: RolloutStorage.Transition = RolloutStorage.Transition()
@@ -215,6 +243,24 @@ class AMP_PPO:
                     "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
                 )
             self.symmetry_cfg = symmetry_cfg
+
+        # Reference to the policy module that owns the MoE gate (if any). Gate
+        # supervision (binding expert i -> skill i) is only possible when the
+        # actor exposes ``get_gate_logits`` and there is more than one skill.
+        self._policy_module = self.actor if RSL_RL_V4_PLUS else self.actor_critic
+        self._gate_supervision_available = (
+            self.num_skills > 1
+            and self.gate_loss_coef > 0.0
+            and hasattr(self._policy_module, "get_gate_logits")
+        )
+        if self.gate_loss_coef > 0.0 and not hasattr(
+            self._policy_module, "get_gate_logits"
+        ):
+            print(
+                "AMP_PPO: gate_loss_coef > 0 but the policy does not expose "
+                "'get_gate_logits' (not a Mixture-of-Experts actor). "
+                "Gate supervision will be disabled."
+            )
 
     def init_storage(
         self,
@@ -357,15 +403,23 @@ class AMP_PPO:
         self.transition.observations = obs
         return self.transition.actions
 
-    def act_amp(self, amp_obs: torch.Tensor) -> None:
+    def act_amp(
+        self, amp_obs: torch.Tensor, skill_ids: Optional[torch.Tensor] = None
+    ) -> None:
         """Store the latest AMP policy observation for later replay insertion.
 
         Parameters
         ----------
         amp_obs : torch.Tensor
             Concatenated AMP observation representing the current policy state.
+        skill_ids : torch.Tensor | None
+            Per-environment integer skill labels (shape ``[num_envs]``) used to
+            route each transition to the replay buffer of the corresponding
+            skill. When ``None`` all transitions go to the single (skill-0)
+            buffer, preserving the original single-skill behaviour.
         """
         self.amp_transition.observations = amp_obs
+        self._amp_skill_ids = skill_ids
 
     def process_env_step(
         self,
@@ -416,13 +470,30 @@ class AMP_PPO:
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
         """Insert a policy-generated AMP transition into the replay buffer.
 
+        When multiple skills are used, the transition of each environment is
+        routed to the replay buffer of the skill that was active for that
+        environment (as recorded by :meth:`act_amp`).
+
         Parameters
         ----------
         amp_obs : torch.Tensor
             Next AMP observation paired with the previously stored policy state.
         """
-        self.amp_storage.insert(self.amp_transition.observations, amp_obs)
+        state = self.amp_transition.observations
+        next_state = amp_obs
+        skill_ids = self._amp_skill_ids
+
+        if self.num_skills == 1 or skill_ids is None:
+            self.amp_storage[0].insert(state, next_state)
+        else:
+            skill_ids = skill_ids.to(state.device).view(-1)
+            for skill_id in range(self.num_skills):
+                mask = skill_ids == skill_id
+                if bool(mask.any()):
+                    self.amp_storage[skill_id].insert(state[mask], next_state[mask])
+
         self.amp_transition.clear()
+        self._amp_skill_ids = None
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute and store GAE-lambda returns from the final observation.
@@ -491,6 +562,11 @@ class AMP_PPO:
         mean_accuracy_expert_elem: float = 0.0
         mean_kl_divergence: float = 0.0
         mean_symmetry_loss: float = 0.0
+        mean_gate_loss: float = 0.0
+        # Number of per-skill discriminator mini-batches actually processed
+        # (skills whose replay buffer is empty are skipped), used to average the
+        # discriminator statistics correctly.
+        num_amp_batches: int = 0
 
         # Create data generators for mini-batch sampling.
         _is_recurrent = (
@@ -509,27 +585,46 @@ class AMP_PPO:
             )
 
         # Generator for policy-generated AMP transitions.
-        amp_policy_generator = self.amp_storage.feed_forward_generator(
-            num_mini_batch=self.num_learning_epochs * self.num_mini_batches,
-            mini_batch_size=(
-                self.storage.num_envs
-                * self.storage.num_transitions_per_env
-                // self.num_mini_batches
-            ),
-            allow_replacement=True,
-        )
-        # Generator for expert AMP data.
-        amp_expert_generator = self.amp_data.feed_forward_generator(
-            self.num_learning_epochs * self.num_mini_batches,
+        num_updates_total = self.num_learning_epochs * self.num_mini_batches
+        amp_mini_batch_size = (
             self.storage.num_envs
             * self.storage.num_transitions_per_env
-            // self.num_mini_batches,
+            // self.num_mini_batches
         )
+        # Only skills that have collected policy transitions this rollout are
+        # trained (an empty replay buffer would make sampling ill-defined). Their
+        # discriminator is simply left unchanged for this update.
+        active_skills = [
+            skill_id
+            for skill_id in range(self.num_skills)
+            if len(self.amp_storage[skill_id]) > 0
+        ]
+        amp_policy_generators = {
+            skill_id: self.amp_storage[skill_id].feed_forward_generator(
+                num_mini_batch=num_updates_total,
+                mini_batch_size=amp_mini_batch_size,
+                allow_replacement=True,
+            )
+            for skill_id in active_skills
+        }
+        # Expert generators. In the single-skill case sample from the full dataset
+        # (skill_id=None) to exactly reproduce the original behaviour.
+        if self.num_skills == 1:
+            amp_expert_generators = {
+                0: self.amp_data.feed_forward_generator(
+                    num_updates_total, amp_mini_batch_size, skill_id=None
+                )
+            }
+        else:
+            amp_expert_generators = {
+                skill_id: self.amp_data.feed_forward_generator(
+                    num_updates_total, amp_mini_batch_size, skill_id=skill_id
+                )
+                for skill_id in active_skills
+            }
 
-        # Loop over mini-batches from the environment transitions and AMP data.
-        for sample, sample_amp_policy, sample_amp_expert in zip(
-            generator, amp_policy_generator, amp_expert_generator
-        ):
+        # Loop over mini-batches from the environment transitions.
+        for sample in generator:
             # Unpack the mini-batch sample from the environment.
             if hasattr(sample, "observations"):
                 obs_batch = sample.observations
@@ -575,6 +670,14 @@ class AMP_PPO:
                 hidden_state_actor, hidden_state_critic = hidden_states_batch
 
             original_batch_size = obs_batch.shape[0]
+
+            # Capture the per-sample skill labels BEFORE any symmetry augmentation:
+            # the augmentation helper rebuilds ``obs_batch`` with only the policy
+            # and critic groups, dropping the "skill" group used for gate
+            # supervision. Mirroring left/right does not change the skill.
+            skill_labels_batch = (
+                obs_batch["skill"] if "skill" in obs_batch.keys() else None
+            )
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -744,64 +847,112 @@ class AMP_PPO:
                     coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
                     ppo_loss = ppo_loss + coeff * symmetry_loss_value
 
-            # Process AMP loss by unpacking policy and expert AMP samples.
-            policy_state, policy_next_state = sample_amp_policy
-            expert_state, expert_next_state = sample_amp_expert
+            # ─── MoE gate-supervision loss ───
+            # Push the gating distribution towards the (environment-provided)
+            # skill label of each sample so that expert i specialises in skill i.
+            gate_loss = torch.zeros((), device=self.device)
+            if self._gate_supervision_available and skill_labels_batch is not None:
+                # get_gate_logits is computed over obs_batch (which may be the
+                # augmented batch); only the original samples have matching labels.
+                gate_logits = self._policy_module.get_gate_logits(obs_batch)[
+                    :original_batch_size
+                ]
+                skill_targets = skill_labels_batch.reshape(-1).long()
+                gate_loss = F.cross_entropy(gate_logits, skill_targets)
+                mean_gate_loss += gate_loss.item()
 
-            if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_data_augmentation", False
-            ):
-                policy_state = self.discriminator.apply_symmetry(
-                    policy_state, obs_type="amp"
-                )
-                policy_next_state = self.discriminator.apply_symmetry(
-                    policy_next_state, obs_type="amp"
-                )
-                expert_state = self.discriminator.apply_symmetry(
-                    expert_state, obs_type="amp"
-                )
-                expert_next_state = self.discriminator.apply_symmetry(
-                    expert_next_state, obs_type="amp"
+            # ─── AMP discriminator loss (per skill) ───
+            # Accumulate the discriminator loss across all active skills so that a
+            # single backward pass jointly updates the shared PPO/actor params and
+            # every skill discriminator.
+            total_amp_loss = torch.zeros((), device=self.device)
+            total_grad_pen_loss = torch.zeros((), device=self.device)
+            # Raw observations for each skill are cached and used to update the
+            # empirical normalizers *after* the optimizer step (under no_grad).
+            normalizer_updates = []
+
+            for skill_id in active_skills:
+                policy_state, policy_next_state = next(amp_policy_generators[skill_id])
+                expert_state, expert_next_state = next(amp_expert_generators[skill_id])
+                disc = self.discriminators[skill_id]
+
+                if self.symmetry_cfg and self.symmetry_cfg.get(
+                    "use_data_augmentation", False
+                ):
+                    policy_state = disc.apply_symmetry(policy_state, obs_type="amp")
+                    policy_next_state = disc.apply_symmetry(
+                        policy_next_state, obs_type="amp"
+                    )
+                    expert_state = disc.apply_symmetry(expert_state, obs_type="amp")
+                    expert_next_state = disc.apply_symmetry(
+                        expert_next_state, obs_type="amp"
+                    )
+
+                # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
+                policy_state = policy_state.to(self.device)
+                policy_next_state = policy_next_state.to(self.device)
+                expert_state = expert_state.to(self.device)
+                expert_next_state = expert_next_state.to(self.device)
+
+                # Keep raw tensors for normalizer updates
+                normalizer_updates.append(
+                    (
+                        skill_id,
+                        expert_state.detach().clone(),
+                        expert_next_state.detach().clone(),
+                        policy_state.detach().clone(),
+                        policy_next_state.detach().clone(),
+                    )
                 )
 
-            # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
-            policy_state = policy_state.to(self.device)
-            policy_next_state = policy_next_state.to(self.device)
-            expert_state = expert_state.to(self.device)
-            expert_next_state = expert_next_state.to(self.device)
+                # Concatenate policy and expert AMP observations for the discriminator input.
+                B_pol = policy_state.size(0)
+                discriminator_input = torch.cat(
+                    (
+                        torch.cat([policy_state, policy_next_state], dim=-1),
+                        torch.cat([expert_state, expert_next_state], dim=-1),
+                    ),
+                    dim=0,
+                )
+                discriminator_output = disc(discriminator_input)
+                policy_d, expert_d = (
+                    discriminator_output[:B_pol],
+                    discriminator_output[B_pol:],
+                )
 
-            # Keep raw tensors for normalizer updates
-            policy_state_raw = policy_state.detach().clone()
-            policy_next_state_raw = policy_next_state.detach().clone()
-            expert_state_raw = expert_state.detach().clone()
-            expert_next_state_raw = expert_next_state.detach().clone()
+                # Compute discriminator losses for this skill
+                amp_loss_k, grad_pen_loss_k = disc.compute_loss(
+                    policy_d=policy_d,
+                    expert_d=expert_d,
+                    sample_amp_expert=(expert_state, expert_next_state),
+                    sample_amp_policy=(policy_state, policy_next_state),
+                    lambda_=10,
+                )
+                total_amp_loss = total_amp_loss + amp_loss_k
+                total_grad_pen_loss = total_grad_pen_loss + grad_pen_loss_k
 
-            # Concatenate policy and expert AMP observations for the discriminator input.
-            B_pol = policy_state.size(0)
-            discriminator_input = torch.cat(
-                (
-                    torch.cat([policy_state, policy_next_state], dim=-1),
-                    torch.cat([expert_state, expert_next_state], dim=-1),
-                ),
-                dim=0,
+                # Discriminator diagnostics (aggregated across skills).
+                with torch.no_grad():
+                    policy_d_prob = torch.sigmoid(policy_d)
+                    expert_d_prob = torch.sigmoid(expert_d)
+                mean_amp_loss += amp_loss_k.item()
+                mean_grad_pen_loss += grad_pen_loss_k.item()
+                mean_policy_pred += policy_d_prob.mean().item()
+                mean_expert_pred += expert_d_prob.mean().item()
+                mean_accuracy_policy += torch.sum(
+                    torch.round(policy_d_prob) == torch.zeros_like(policy_d_prob)
+                ).item()
+                mean_accuracy_expert += torch.sum(
+                    torch.round(expert_d_prob) == torch.ones_like(expert_d_prob)
+                ).item()
+                mean_accuracy_expert_elem += expert_d_prob.numel()
+                mean_accuracy_policy_elem += policy_d_prob.numel()
+                num_amp_batches += 1
+
+            # The final loss combines the PPO loss, gate-supervision loss and AMP losses.
+            loss = ppo_loss + self.gate_loss_coef * gate_loss + (
+                total_amp_loss + total_grad_pen_loss
             )
-            discriminator_output = self.discriminator(discriminator_input)
-            policy_d, expert_d = (
-                discriminator_output[:B_pol],
-                discriminator_output[B_pol:],
-            )
-
-            # Compute discriminator losses
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d=policy_d,
-                expert_d=expert_d,
-                sample_amp_expert=(expert_state, expert_next_state),
-                sample_amp_policy=(policy_state, policy_next_state),
-                lambda_=10,
-            )
-
-            # The final loss combines the PPO loss with AMP losses.
-            loss = ppo_loss + (amp_loss + grad_pen_loss)
 
             # Backpropagation and optimizer step.
             self.optimizer.zero_grad()
@@ -815,51 +966,43 @@ class AMP_PPO:
                 )
             self.optimizer.step()
 
-            # Update the normalizer with RAW (unnormalized) observations under no_grad
-            self.discriminator.update_normalization(
+            # Update the normalizers with RAW (unnormalized) observations under no_grad
+            for (
+                skill_id,
                 expert_state_raw,
                 expert_next_state_raw,
                 policy_state_raw,
                 policy_next_state_raw,
-            )
+            ) in normalizer_updates:
+                self.discriminators[skill_id].update_normalization(
+                    expert_state_raw,
+                    expert_next_state_raw,
+                    policy_state_raw,
+                    policy_next_state_raw,
+                )
 
-            # Compute probabilities from the discriminator logits.
-            policy_d_prob = torch.sigmoid(policy_d)
-            expert_d_prob = torch.sigmoid(expert_d)
-
-            # Update running statistics.
+            # Update running PPO statistics.
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
-            mean_amp_loss += amp_loss.item()
-            mean_grad_pen_loss += grad_pen_loss.item()
-            mean_policy_pred += policy_d_prob.mean().item()
-            mean_expert_pred += expert_d_prob.mean().item()
             mean_symmetry_loss += symmetry_loss_value.item()
-
-            # Calculate the accuracy of the discriminator.
-            mean_accuracy_policy += torch.sum(
-                torch.round(policy_d_prob) == torch.zeros_like(policy_d_prob)
-            ).item()
-            mean_accuracy_expert += torch.sum(
-                torch.round(expert_d_prob) == torch.ones_like(expert_d_prob)
-            ).item()
-
-            # Record the total number of elements processed.
-            mean_accuracy_expert_elem += expert_d_prob.numel()
-            mean_accuracy_policy_elem += policy_d_prob.numel()
 
         # Average the statistics over all mini-batches.
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
-        mean_amp_loss /= num_updates
-        mean_grad_pen_loss /= num_updates
-        mean_policy_pred /= num_updates
-        mean_expert_pred /= num_updates
+        # Discriminator statistics are averaged over the number of per-skill
+        # discriminator batches that were actually processed.
+        _amp_denom = max(1, num_amp_batches)
+        mean_amp_loss /= _amp_denom
+        mean_grad_pen_loss /= _amp_denom
+        mean_policy_pred /= _amp_denom
+        mean_expert_pred /= _amp_denom
         mean_accuracy_policy /= max(1, mean_accuracy_policy_elem)
         mean_accuracy_expert /= max(1, mean_accuracy_expert_elem)
         mean_kl_divergence /= num_updates
         mean_symmetry_loss /= num_updates
+        mean_gate_loss /= num_updates
+        self.mean_gate_loss = mean_gate_loss
 
         # Clear the storage for the next update cycle.
         self.storage.clear()

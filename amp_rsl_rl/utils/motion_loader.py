@@ -273,6 +273,14 @@ class AMPLoader:
         simulation_dt: Timestep used by the simulator
         slow_down_factor: Integer factor to slow down original data
         expected_joint_names: (Optional) override for joint ordering
+        skills: (Optional) ordered mapping ``skill_name -> [dataset_name, ...]`` grouping the
+            datasets into skills. The insertion order of the keys defines the integer skill id
+            (first key -> skill 0, second -> skill 1, ...). When provided, the loader additionally
+            builds per-skill sampling buffers so that :meth:`feed_forward_generator` can draw
+            expert transitions belonging to a single skill (via the ``skill_id`` argument). A
+            dataset may be listed under more than one skill (e.g. a standing reference shared by
+            both a locomotion and a turn-in-place skill). When ``None`` (default) a single skill
+            containing every dataset is assumed, preserving the original behaviour.
     """
 
     def __init__(
@@ -285,6 +293,7 @@ class AMPLoader:
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        skills: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
@@ -308,6 +317,34 @@ class AMPLoader:
         # ─── Parse dataset names and weights ───
         dataset_names = list(datasets.keys())
         dataset_weights = list(datasets.values())
+
+        # ─── Resolve skill grouping ───
+        # ``skills`` maps an ordered skill name to the list of dataset names that
+        # belong to it. The key order defines the integer skill id. When not
+        # provided we fall back to a single skill containing every dataset.
+        if skills is None:
+            skills = {"default": list(dataset_names)}
+        self.skill_names: List[str] = list(skills.keys())
+        self.num_skills: int = len(self.skill_names)
+
+        dataset_to_skills: Dict[str, List[int]] = {}
+        for skill_id, skill_name in enumerate(self.skill_names):
+            for dname in skills[skill_name]:
+                # A dataset may be shared across multiple skills (e.g. a standing
+                # reference used by both a locomotion and a turn-in-place skill).
+                dataset_to_skills.setdefault(dname, []).append(skill_id)
+        missing = [d for d in dataset_names if d not in dataset_to_skills]
+        if missing:
+            raise ValueError(
+                "The following datasets are not assigned to any skill in the "
+                f"`skills` mapping: {missing}. Skills provided: {self.skill_names}."
+            )
+        # Skill ids for each dataset, aligned with ``dataset_names``/``self.motion_data``.
+        # Each entry is the list of skills the dataset contributes to.
+        self.dataset_skill_ids: List[List[int]] = [
+            dataset_to_skills[d] for d in dataset_names
+        ]
+        # ─────────────────────────────────────────
 
         # ─── Build union of all joint names if not provided ───
         if expected_joint_names is None:
@@ -387,6 +424,43 @@ class AMPLoader:
             ]
         )
         self.per_frame_weights_reset = per_frame_reset / per_frame_reset.sum()
+
+        # ─── Build per-skill observation buffers and sampling weights ───
+        # For each skill we concatenate the (augmented) obs/next-obs of the
+        # datasets that belong to it, together with a per-frame sampling weight
+        # normalised within the skill. This lets the discriminator of a given
+        # skill be trained only on the expert transitions of that skill.
+        self.skill_obs: List[torch.Tensor] = []
+        self.skill_next_obs: List[torch.Tensor] = []
+        self.skill_per_frame_weights: List[torch.Tensor] = []
+        for skill_id in range(self.num_skills):
+            ds_indices = [
+                i
+                for i, skill_ids in enumerate(self.dataset_skill_ids)
+                if skill_id in skill_ids
+            ]
+            if len(ds_indices) == 0:
+                raise ValueError(
+                    f"Skill '{self.skill_names[skill_id]}' has no datasets assigned."
+                )
+            self.skill_obs.append(
+                torch.cat([obs_list[i] for i in ds_indices], dim=0)
+            )
+            self.skill_next_obs.append(
+                torch.cat([next_obs_list[i] for i in ds_indices], dim=0)
+            )
+            skill_weights = torch.cat(
+                [
+                    torch.full(
+                        (augmented_lengths[i],),
+                        float(self.dataset_weights[i]) / augmented_lengths[i],
+                        device=self.device,
+                    )
+                    for i in ds_indices
+                ]
+            )
+            self.skill_per_frame_weights.append(skill_weights / skill_weights.sum())
+        # ────────────────────────────────────────────────────────────────
 
     def _apply_symmetry(
         self,
@@ -538,7 +612,7 @@ class AMPLoader:
         )
 
     def feed_forward_generator(
-        self, num_mini_batch: int, mini_batch_size: int
+        self, num_mini_batch: int, mini_batch_size: int, skill_id: Optional[int] = None
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
         """
         Yields mini-batches of (state, next_state) pairs for training,
@@ -547,14 +621,23 @@ class AMPLoader:
         Args:
             num_mini_batch: Number of mini-batches to yield
             mini_batch_size: Size of each mini-batch
+            skill_id: (Optional) if provided, samples only from the expert
+                transitions belonging to that skill. When ``None`` (default) the
+                full dataset (all skills) is used.
         Yields:
             Tuple of (state, next_state) tensors
         """
+        if skill_id is None:
+            obs_buffer = self.all_obs
+            next_obs_buffer = self.all_next_obs
+            weights = self.per_frame_weights
+        else:
+            obs_buffer = self.skill_obs[skill_id]
+            next_obs_buffer = self.skill_next_obs[skill_id]
+            weights = self.skill_per_frame_weights[skill_id]
         for _ in range(num_mini_batch):
-            idx = torch.multinomial(
-                self.per_frame_weights, mini_batch_size, replacement=True
-            )
-            yield self.all_obs[idx], self.all_next_obs[idx]
+            idx = torch.multinomial(weights, mini_batch_size, replacement=True)
+            yield obs_buffer[idx], next_obs_buffer[idx]
 
     def get_state_for_reset(
         self,
