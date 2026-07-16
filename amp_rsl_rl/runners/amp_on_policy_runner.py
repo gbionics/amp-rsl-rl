@@ -663,6 +663,9 @@ class AMPOnPolicyRunner:
         )
 
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+        _disc_lr = getattr(self.alg, "discriminator_learning_rate", None)
+        if _disc_lr is not None:
+            self.writer.add_scalar("Loss/discriminator_learning_rate", _disc_lr, locs["it"])
         self.writer.add_scalar(
             "Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"]
         )

@@ -196,6 +196,51 @@ def test_multiskill_update_runs():
         assert np.isfinite(alg.mean_gate_loss)
 
 
+def test_discriminator_learning_rate_decoupled():
+    """A dedicated discriminator LR is applied and kept out of the adaptive schedule."""
+    torch.manual_seed(0)
+    with tempfile.TemporaryDirectory() as tmp:
+        loader = _build_loader(Path(tmp))
+        obs = _make_obs()
+        obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+        actor_critic = ActorCriticMoE(
+            obs,
+            obs_groups,
+            NUM_ACTIONS,
+            actor_hidden_dims=[32, 32],
+            critic_hidden_dims=[32, 32],
+            num_experts=NUM_SKILLS,
+        )
+        discriminators = [
+            Discriminator(
+                input_dim=AMP_DIM * 2,
+                hidden_layer_sizes=[16, 16],
+                reward_scale=1.0,
+                device="cpu",
+            )
+            for _ in range(NUM_SKILLS)
+        ]
+        disc_lr = 2e-4
+        alg = AMP_PPO(
+            discriminators=discriminators,
+            amp_data=loader,
+            actor_critic=actor_critic,
+            num_learning_epochs=1,
+            num_mini_batches=1,
+            learning_rate=1e-3,
+            schedule="adaptive",
+            desired_kl=0.01,
+            discriminator_learning_rate=disc_lr,
+            device="cpu",
+        )
+        # Discriminator groups must use the dedicated LR; policy groups the base LR.
+        for pg in alg.optimizer.param_groups:
+            if str(pg.get("name", "")).startswith("amp_"):
+                assert pg["lr"] == disc_lr
+            else:
+                assert pg["lr"] == 1e-3
+
+
 def _aug_obs(obs=None, actions=None, obs_type=None):
     """Trivial symmetry augmentation: concatenate [obs, obs] for the requested
     groups only. Mirrors the real ``mirror_observations`` behaviour where the
@@ -291,4 +336,5 @@ if __name__ == "__main__":
     test_shared_dataset_across_skills()
     test_multiskill_update_runs()
     test_multiskill_update_with_augmentation()
+    test_discriminator_learning_rate_decoupled()
     print("all multi-skill AMP tests passed")

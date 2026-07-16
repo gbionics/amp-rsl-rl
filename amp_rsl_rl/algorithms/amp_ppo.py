@@ -103,6 +103,8 @@ class AMP_PPO:
         device: str = "cpu",
         discriminators: Optional[Sequence[Discriminator]] = None,
         gate_loss_coef: float = 0.0,
+        discriminator_learning_rate: Optional[float] = None,
+        grad_pen_scale: float = 10.0,
     ) -> None:
         # Set device and learning hyperparameters
         self.device: str = device
@@ -113,6 +115,16 @@ class AMP_PPO:
             normalize_advantage_per_mini_batch
         )
         self.gate_loss_coef: float = gate_loss_coef
+        # Optional dedicated (fixed) learning rate for the discriminator(s). When
+        # set, the discriminator parameter groups are trained at this rate and are
+        # NOT touched by the adaptive-KL learning-rate schedule that governs the
+        # actor/critic. This prevents the discriminator from overpowering the
+        # policy (a common cause of discriminator saturation / vanishing AMP
+        # reward). When ``None`` the legacy behaviour is kept (the discriminator
+        # shares the policy learning rate, including adaptive updates).
+        self.discriminator_learning_rate: Optional[float] = discriminator_learning_rate
+        # Coefficient of the discriminator gradient penalty (R1 / WGAN-GP).
+        self.grad_pen_scale: float = grad_pen_scale
 
         if RSL_RL_V4_PLUS:
             if actor is None or critic is None:
@@ -174,12 +186,21 @@ class AMP_PPO:
 
         # Create optimizer for both the actor-critic and the discriminator.
         # Note: Weight decay is set differently for discriminator trunk and head.
+        # When a dedicated discriminator learning rate is configured, it is set
+        # directly on the discriminator param groups so it stays fixed (the
+        # adaptive schedule below only touches the actor/critic groups).
+        disc_lr = (
+            self.discriminator_learning_rate
+            if self.discriminator_learning_rate is not None
+            else learning_rate
+        )
         disc_params = []
         for skill_id, disc in enumerate(self.discriminators):
             disc_params.append(
                 {
                     "params": disc.trunk.parameters(),
                     "weight_decay": 10e-4,
+                    "lr": disc_lr,
                     "name": f"amp_trunk_{skill_id}",
                 }
             )
@@ -187,6 +208,7 @@ class AMP_PPO:
                 {
                     "params": disc.linear.parameters(),
                     "weight_decay": 10e-2,
+                    "lr": disc_lr,
                     "name": f"amp_head_{skill_id}",
                 }
             )
@@ -765,6 +787,14 @@ class AMP_PPO:
                         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
                     for param_group in self.optimizer.param_groups:
+                        # When the discriminator has its own dedicated learning
+                        # rate, keep it fixed: the adaptive KL schedule only
+                        # governs the actor/critic param groups.
+                        if (
+                            self.discriminator_learning_rate is not None
+                            and str(param_group.get("name", "")).startswith("amp_")
+                        ):
+                            continue
                         param_group["lr"] = self.learning_rate
 
             # Compute the PPO surrogate loss.
@@ -926,7 +956,7 @@ class AMP_PPO:
                     expert_d=expert_d,
                     sample_amp_expert=(expert_state, expert_next_state),
                     sample_amp_policy=(policy_state, policy_next_state),
-                    lambda_=10,
+                    lambda_=self.grad_pen_scale,
                 )
                 total_amp_loss = total_amp_loss + amp_loss_k
                 total_grad_pen_loss = total_grad_pen_loss + grad_pen_loss_k
