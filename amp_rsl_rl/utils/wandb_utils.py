@@ -16,7 +16,12 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         run_name = os.path.split(log_dir)[-1]
         
         # Thanks to https://github.com/leggedrobotics/rsl_rl/pull/80/
-        project = cfg.get('wandb_project') or cfg.get('wandb_kwargs', {}).get('project')
+        # Prefer ``wandb_kwargs.project`` over the top-level ``wandb_project``:
+        # the rsl-rl v5 runner config sets a truthy default ``wandb_project``
+        # ("isaaclab"), and both the per-task config and the ``--log_project_name``
+        # CLI override write to ``wandb_kwargs["project"]``. Reading
+        # ``wandb_project`` first would let the default shadow those values.
+        project = cfg.get('wandb_kwargs', {}).get('project') or cfg.get('wandb_project')
         if project is None:
             raise KeyError(
                 "Please specify 'wandb_project' or 'wandb_kwargs.project' in the runner config."
@@ -55,9 +60,7 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
 
         self.video_files = []
 
-        self.update_run_name_with_sequence(
-            prefix=cfg["wandb_kwargs"]["project"]
-        )
+        self.update_run_name_with_sequence(prefix=project)
 
 
     # Provide a ``log_config`` API compatible with both rsl-rl versions. Older
