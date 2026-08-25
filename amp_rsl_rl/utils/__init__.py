@@ -10,13 +10,15 @@ from .motion_loader import (
     AMPLoader,
     download_amp_dataset_from_hf,
     _call_augmentation_func,
-    VelocityRepresentation
+    VelocityRepresentation,
+    QuaternionConvention,
 )
 from .exporter import export_policy_as_onnx
 
 __all__ = [
     "AMPLoader",
     "VelocityRepresentation",
+    "QuaternionConvention",
     "download_amp_dataset_from_hf",
     "_call_augmentation_func",
     "export_policy_as_onnx",

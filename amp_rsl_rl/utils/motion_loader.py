@@ -39,6 +39,25 @@ class VelocityRepresentation(Enum):
     MIXED_REPRESENTATION = "mixed"
 
 
+class QuaternionConvention(Enum):
+    """Serialization convention for quaternions exposed by the loader.
+
+    Different simulators/frameworks expect different orderings of the
+    quaternion components. IsaacLab, for instance, changed its expected
+    convention across versions, so this allows callers to select the
+    convention that matches the framework version they are targeting.
+
+    Attributes:
+        WXYZ: Scalar-first ordering ``(w, x, y, z)``. This matches the
+            historical Isaac Gym / older IsaacLab convention.
+        XYZW: Scalar-last ordering ``(x, y, z, w)``. This is the SciPy
+            default and matches newer IsaacLab versions.
+    """
+
+    WXYZ = "wxyz"
+    XYZW = "xyzw"
+
+
 def download_amp_dataset_from_hf(
     destination_dir: Path,
     robot_folder: str,
@@ -123,11 +142,14 @@ class MotionData:
         - base_ang_velocities_mixed: (currently zeros)
         - base_lin_velocities_local: linear velocity in local (body) frame
         - base_ang_velocities_local: (currently zeros)
-        - base_quat: orientation quaternion as torch.Tensor in wxyz order
+        - base_quat: orientation quaternion as torch.Tensor, serialized according
+          to `base_quat_convention` (defaults to `wxyz`)
 
     Notes:
         - The quaternion is expected in the dataset as `xyzw` format (SciPy default),
-          and it is converted internally to `wxyz` format to be compatible with IsaacLab conventions.
+          and it is converted internally to the format specified by
+          `base_quat_convention` (defaults to `wxyz`, to be compatible with
+          historical IsaacLab conventions).
         - All data is converted to torch.Tensor on the specified device during initialization.
     """
 
@@ -139,6 +161,7 @@ class MotionData:
     base_ang_velocities_local: Union[torch.Tensor, np.ndarray]
     base_quat: Union[Rotation, torch.Tensor]
     device: torch.device = torch.device("cpu")
+    base_quat_convention: QuaternionConvention = QuaternionConvention.WXYZ
 
     def __post_init__(self) -> None:
         # Convert numpy arrays (or SciPy Rotations) to torch tensors
@@ -159,9 +182,12 @@ class MotionData:
             self.base_ang_velocities_local = to_tensor(self.base_ang_velocities_local)
         if isinstance(self.base_quat, Rotation):
             quat_xyzw = self.base_quat.as_quat()  # (T,4) xyzw
-            # convert to wxyz
+            if self.base_quat_convention == QuaternionConvention.WXYZ:
+                quat_reordered = quat_xyzw[:, [3, 0, 1, 2]]
+            else:
+                quat_reordered = quat_xyzw
             self.base_quat = torch.tensor(
-                quat_xyzw[:, [3, 0, 1, 2]],
+                quat_reordered,
                 device=self.device,
                 dtype=torch.float32,
             )
@@ -273,6 +299,11 @@ class AMPLoader:
         simulation_dt: Timestep used by the simulator
         slow_down_factor: Integer factor to slow down original data
         expected_joint_names: (Optional) override for joint ordering
+        quaternion_convention: Serialization convention used for the `base_quat`
+            returned by this loader (and for the reset states). Defaults to
+            `QuaternionConvention.WXYZ` (scalar-first, historical IsaacLab/Isaac
+            Gym convention). Set to `QuaternionConvention.XYZW` (scalar-last,
+            SciPy default) to match newer IsaacLab versions.
     """
 
     def __init__(
@@ -285,9 +316,11 @@ class AMPLoader:
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        quaternion_convention: QuaternionConvention = QuaternionConvention.WXYZ,
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
+        self.quaternion_convention = quaternion_convention
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
 
@@ -535,6 +568,7 @@ class AMPLoader:
             base_ang_velocities_local=resampled_base_ang_vel_local,
             base_quat=resampled_base_orientations,
             device=self.device,
+            base_quat_convention=self.quaternion_convention,
         )
 
     def feed_forward_generator(
