@@ -1,8 +1,12 @@
 import os
 import warnings
 import wandb
-from rsl_rl.utils.wandb_utils import WandbSummaryWriter as RslWandbSummaryWriter
 from torch.utils.tensorboard import SummaryWriter
+
+from amp_rsl_rl.utils._compat import (
+    WandbSummaryWriterBase as RslWandbSummaryWriter,
+    RSL_RL_WANDB_HAS_LOG_CONFIG,
+)
 
 class WandbSummaryWriter(RslWandbSummaryWriter):
     def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
@@ -54,6 +58,32 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         self.update_run_name_with_sequence(
             prefix=cfg["wandb_kwargs"]["project"]
         )
+
+
+    # Provide a ``log_config`` API compatible with both rsl-rl versions. Older
+    # releases implement it on the base writer; rsl-rl v5 removed it, so fall
+    # back to replicating the legacy behavior. The AMP runner calls this once
+    # at startup with the environment, runner, algorithm and policy configs.
+    def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg) -> None:
+        if RSL_RL_WANDB_HAS_LOG_CONFIG:
+            super().log_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
+            return
+        try:
+            wandb.config.update(
+                {
+                    "runner_cfg": runner_cfg,
+                    "policy_cfg": policy_cfg,
+                    "alg_cfg": alg_cfg,
+                },
+                allow_val_change=True,
+            )
+        except Exception:
+            pass
+        try:
+            env_cfg_dict = env_cfg.to_dict() if hasattr(env_cfg, "to_dict") else env_cfg
+            wandb.config.update({"env_cfg": env_cfg_dict}, allow_val_change=True)
+        except Exception:
+            pass
 
 
     # To save video files to wandb explicitly
