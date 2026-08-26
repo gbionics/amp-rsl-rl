@@ -1,8 +1,12 @@
 import os
 import warnings
 import wandb
-from rsl_rl.utils.wandb_utils import WandbSummaryWriter as RslWandbSummaryWriter
 from torch.utils.tensorboard import SummaryWriter
+
+from amp_rsl_rl.utils._compat import (
+    WandbSummaryWriterBase as RslWandbSummaryWriter,
+    RSL_RL_WANDB_HAS_LOG_CONFIG,
+)
 
 class WandbSummaryWriter(RslWandbSummaryWriter):
     def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
@@ -12,7 +16,12 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         run_name = os.path.split(log_dir)[-1]
         
         # Thanks to https://github.com/leggedrobotics/rsl_rl/pull/80/
-        project = cfg.get('wandb_project') or cfg.get('wandb_kwargs', {}).get('project')
+        # Prefer ``wandb_kwargs.project`` over the top-level ``wandb_project``:
+        # the rsl-rl v5 runner config sets a truthy default ``wandb_project``
+        # ("isaaclab"), and both the per-task config and the ``--log_project_name``
+        # CLI override write to ``wandb_kwargs["project"]``. Reading
+        # ``wandb_project`` first would let the default shadow those values.
+        project = cfg.get('wandb_kwargs', {}).get('project') or cfg.get('wandb_project')
         if project is None:
             raise KeyError(
                 "Please specify 'wandb_project' or 'wandb_kwargs.project' in the runner config."
@@ -51,9 +60,33 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
 
         self.video_files = []
 
-        self.update_run_name_with_sequence(
-            prefix=cfg["wandb_kwargs"]["project"]
-        )
+        self.update_run_name_with_sequence(prefix=project)
+
+
+    # Provide a ``log_config`` API compatible with both rsl-rl versions. Older
+    # releases implement it on the base writer; rsl-rl v5 removed it, so fall
+    # back to replicating the legacy behavior. The AMP runner calls this once
+    # at startup with the environment, runner, algorithm and policy configs.
+    def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg) -> None:
+        if RSL_RL_WANDB_HAS_LOG_CONFIG:
+            super().log_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
+            return
+        try:
+            wandb.config.update(
+                {
+                    "runner_cfg": runner_cfg,
+                    "policy_cfg": policy_cfg,
+                    "alg_cfg": alg_cfg,
+                },
+                allow_val_change=True,
+            )
+        except Exception:
+            pass
+        try:
+            env_cfg_dict = env_cfg.to_dict() if hasattr(env_cfg, "to_dict") else env_cfg
+            wandb.config.update({"env_cfg": env_cfg_dict}, allow_val_change=True)
+        except Exception:
+            pass
 
 
     # To save video files to wandb explicitly
