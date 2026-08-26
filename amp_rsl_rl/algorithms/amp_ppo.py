@@ -15,7 +15,7 @@ from tensordict import TensorDict
 
 from rsl_rl.storage import RolloutStorage
 
-from amp_rsl_rl.storage import ReplayBuffer
+from amp_rsl_rl.storage import ReplayBuffer, build_rollout_storage
 from amp_rsl_rl.networks import Discriminator
 from amp_rsl_rl.utils import AMPLoader, _call_augmentation_func
 from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS, RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
@@ -236,7 +236,7 @@ class AMP_PPO:
         action_shape : Tuple[int, ...]
             Shape of the action vector output by the policy.
         """
-        self.storage = RolloutStorage(
+        self.storage = build_rollout_storage(
             training_type="rl",
             num_envs=num_envs,
             num_transitions_per_env=num_transitions_per_env,
