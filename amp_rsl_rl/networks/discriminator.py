@@ -231,9 +231,9 @@ class Discriminator(nn.Module):
         lambda_: float = 10,
     ):
 
-        # Compute gradient penalty to stabilize discriminator training.
-        sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
-        sample_amp_policy = tuple(self.amp_normalizer(s) for s in sample_amp_policy)
+        # Compute gradient penalty on RAW (unnormalized) inputs.
+        # compute_grad_pen normalizes internally so that the penalty
+        # measures ||∇_x D(x)||² w.r.t. the true discriminator input.
         grad_pen_loss = self.compute_grad_pen(
             expert_states=sample_amp_expert,
             policy_states=sample_amp_policy,
@@ -248,6 +248,19 @@ class Discriminator(nn.Module):
             amp_loss = self.wgan_loss(policy_d=policy_d, expert_d=expert_d)
         return amp_loss, grad_pen_loss
 
+    def _forward_detached_std(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with normalization and detached minibatch-std (for gradient penalty)."""
+        state, next_state = torch.split(x, self.input_dim // 2, dim=-1)
+        state = self.amp_normalizer(state)
+        next_state = self.amp_normalizer(next_state)
+        x_norm = torch.cat([state, next_state], dim=-1)
+        h = self.trunk(x_norm)
+        if self.use_minibatch_std:
+            with torch.no_grad():
+                s = self._minibatch_std_scalar(h)
+            h = torch.cat([h, s], dim=-1)
+        return self.linear(h)
+
     def compute_grad_pen(
         self,
         expert_states: tuple[torch.Tensor, torch.Tensor],
@@ -255,6 +268,10 @@ class Discriminator(nn.Module):
         lambda_: float = 10,
     ) -> torch.Tensor:
         """Computes the gradient penalty used to regularize the discriminator.
+
+        The inputs are expected to be **raw** (unnormalized) states.
+        Normalization is applied internally so the penalty measures
+        ``||∇_x D(x)||²`` w.r.t. the true discriminator input.
 
         Args:
             expert_states (tuple[Tensor, Tensor]): A tuple containing batches of expert states and expert next states.
@@ -272,12 +289,7 @@ class Discriminator(nn.Module):
             alpha = alpha.expand_as(expert)
             data = alpha * expert + (1 - alpha) * policy
             data = data.detach().requires_grad_(True)
-            h = self.trunk(data)
-            if self.use_minibatch_std:
-                with torch.no_grad():
-                    s = self._minibatch_std_scalar(h)
-                h = torch.cat([h, s], dim=-1)
-            scores = self.linear(h)
+            scores = self._forward_detached_std(data)
             grad = autograd.grad(
                 outputs=scores,
                 inputs=data,
@@ -290,14 +302,9 @@ class Discriminator(nn.Module):
         elif self.loss_type == "BCEWithLogits":
             # R1 regularizer on REAL: 0.5 * lambda * ||∇_x D(x_real)||^2
             data = expert.detach().requires_grad_(True)
-            # Compute D(x_real) with minibatch-std DETACHED,
-            # so gradients are w.r.t. the sample itself, not the batch statistics.
-            h = self.trunk(data)
-            if self.use_minibatch_std:
-                with torch.no_grad():
-                    s = self._minibatch_std_scalar(h)
-                h = torch.cat([h, s], dim=-1)
-            scores = self.linear(h)
+            # Route through the full discriminator pipeline (normalize → trunk → linear)
+            # with minibatch-std DETACHED so gradients are w.r.t. the raw input.
+            scores = self._forward_detached_std(data)
 
             grad = autograd.grad(
                 outputs=scores.sum(),
