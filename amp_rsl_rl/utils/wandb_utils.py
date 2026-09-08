@@ -59,6 +59,8 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         }
 
         self.video_files = []
+        # rsl-rl v5's Logger.save_video (inherited) tracks uploads here.
+        self.logged_videos: set[str] = set()
 
         self.update_run_name_with_sequence(prefix=project)
 
