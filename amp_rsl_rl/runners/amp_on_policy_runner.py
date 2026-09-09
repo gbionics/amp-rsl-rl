@@ -264,17 +264,17 @@ class AMPOnPolicyRunner:
             ).to(self.device)
 
         amp_joint_names = self.dataset_cfg.get("amp_joint_names", None)
-        if amp_joint_names is None and not RSL_RL_V4_PLUS:
+        if amp_joint_names is None:
             try:
                 amp_joint_names = self.env.cfg.observations.amp.joint_pos.params[
                     "asset_cfg"
                 ].joint_names
-            except AttributeError:
+            except (AttributeError, KeyError, TypeError):
                 warnings.warn(
-                    "Could not resolve amp_joint_names from "
-                    "env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names. "
-                    "Falling back to None. Set 'amp_joint_names' in dataset_cfg explicitly "
-                    "to silence this warning.",
+                    "Could not resolve amp_joint_names from"
+                    " env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names."
+                    " Falling back to None. Set 'amp_joint_names' in dataset_cfg"
+                    " explicitly to silence this warning.",
                     stacklevel=2,
                 )
                 amp_joint_names = None

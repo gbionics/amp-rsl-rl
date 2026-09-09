@@ -160,6 +160,30 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Wandb summary writer base class
+# ---------------------------------------------------------------------------
+# - v3 / v4 / v5.0-v5.3: rsl_rl.utils.wandb_utils.WandbSummaryWriter
+#       (provides a ``log_config`` method)
+# - v5.4+: logging refactor (PR #211) renamed it to
+#       rsl_rl.utils.wandb_log_writer.WandbLogWriter and dropped ``log_config``
+#
+# Re-exported as ``WandbSummaryWriterBase`` so downstream writers can subclass a
+# single stable name. ``RSL_RL_WANDB_HAS_LOG_CONFIG`` records whether the base
+# class still provides the legacy ``log_config`` method (removed in v5.4).
+
+try:
+    from rsl_rl.utils.wandb_log_writer import (  # noqa: F401
+        WandbLogWriter as WandbSummaryWriterBase,
+    )
+except (ImportError, ModuleNotFoundError):
+    from rsl_rl.utils.wandb_utils import (  # noqa: F401
+        WandbSummaryWriter as WandbSummaryWriterBase,
+    )
+
+RSL_RL_WANDB_HAS_LOG_CONFIG: bool = hasattr(WandbSummaryWriterBase, "log_config")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -173,4 +197,6 @@ __all__ = [
     "EmpiricalNormalization",
     "store_code_state",
     "resolve_obs_groups",
+    "WandbSummaryWriterBase",
+    "RSL_RL_WANDB_HAS_LOG_CONFIG",
 ]
