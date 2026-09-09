@@ -70,6 +70,10 @@ class AMP_PPO:
         Enables smooth ratio clipping instead of hard clamping.
     normalize_advantage_per_mini_batch : bool, default=False
         Whether to normalize advantages within each mini-batch (instead of the entire rollout).
+    use_mixed_precision : bool, default=False
+        Enable bfloat16 autocast for the network forward passes and loss computation during
+        ``update`` (ports rsl-rl-lib #219). Default ``False`` is a no-op and keeps full FP32
+        numerics identical to before; ``True`` trades a little precision for speed on GPU.
     symmetry_cfg : dict | None, default=None
         Configuration dict enabling symmetry-based data augmentation and mirror loss.
     device : str, default="cpu"
@@ -98,6 +102,7 @@ class AMP_PPO:
         amp_replay_buffer_size: int = 100000,
         use_smooth_ratio_clipping: bool = False,
         normalize_advantage_per_mini_batch: bool = False,
+        use_mixed_precision: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
     ) -> None:
@@ -187,6 +192,11 @@ class AMP_PPO:
         self.max_grad_norm: float = max_grad_norm
         self.use_clipped_value_loss: bool = use_clipped_value_loss
         self.use_smooth_ratio_clipping: bool = use_smooth_ratio_clipping
+        # Opt-in bfloat16 mixed precision (ports rsl-rl-lib #219). Default off -> autocast
+        # is a no-op, so FP32 numerics are unchanged. self._autocast_device_type is the
+        # device kind ("cuda"/"cpu") required by torch.amp.autocast.
+        self.use_mixed_precision: bool = use_mixed_precision
+        self._autocast_device_type: str = torch.device(device).type
 
         # Symmetry configuration for PPO and AMP augmentation
         self.symmetry_cfg: Optional[Dict[str, Any]] = None
@@ -605,40 +615,49 @@ class AMP_PPO:
                 returns_batch = self._repeat_along_batch(returns_batch, num_aug)
 
             # Forward pass through the actor to get current policy outputs.
-            if RSL_RL_V4_PLUS:
-                _ = self.actor(
-                    obs_batch,
-                    masks=masks_batch,
-                    hidden_state=hidden_state_actor,
-                    stochastic_output=True,
-                )
-                actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
-                value_batch = self.critic(
-                    obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
-                )
-                if hasattr(self.actor, "get_distribution_params"):
-                    dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0][:original_batch_size]
-                    sigma_batch = dist_params[1][:original_batch_size]
-                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
+            # Opt-in bfloat16 autocast accelerates the actor/critic matmuls. It is a no-op
+            # when use_mixed_precision is False, so default FP32 numerics are unchanged.
+            with torch.amp.autocast(
+                device_type=self._autocast_device_type,
+                enabled=self.use_mixed_precision,
+                dtype=torch.bfloat16,
+            ):
+                if RSL_RL_V4_PLUS:
+                    _ = self.actor(
+                        obs_batch,
+                        masks=masks_batch,
+                        hidden_state=hidden_state_actor,
+                        stochastic_output=True,
+                    )
+                    actions_log_prob_batch = self.actor.get_output_log_prob(
+                        actions_batch
+                    )
+                    value_batch = self.critic(
+                        obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
+                    )
+                    if hasattr(self.actor, "get_distribution_params"):
+                        dist_params = self.actor.get_distribution_params()
+                        mu_batch = dist_params[0][:original_batch_size]
+                        sigma_batch = dist_params[1][:original_batch_size]
+                        entropy_batch = self.actor.get_entropy()[:original_batch_size]
+                    else:
+                        mu_batch = self.actor.output_mean[:original_batch_size]
+                        sigma_batch = self.actor.output_std[:original_batch_size]
+                        entropy_batch = self.actor.output_entropy[:original_batch_size]
                 else:
-                    mu_batch = self.actor.output_mean[:original_batch_size]
-                    sigma_batch = self.actor.output_std[:original_batch_size]
-                    entropy_batch = self.actor.output_entropy[:original_batch_size]
-            else:
-                # v3
-                self.actor_critic.act(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
-                )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
-                    actions_batch
-                )
-                value_batch = self.actor_critic.evaluate(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
-                )
-                mu_batch = self.actor_critic.action_mean[:original_batch_size]
-                sigma_batch = self.actor_critic.action_std[:original_batch_size]
-                entropy_batch = self.actor_critic.entropy[:original_batch_size]
+                    # v3
+                    self.actor_critic.act(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
+                    )
+                    actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                        actions_batch
+                    )
+                    value_batch = self.actor_critic.evaluate(
+                        obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
+                    )
+                    mu_batch = self.actor_critic.action_mean[:original_batch_size]
+                    sigma_batch = self.actor_critic.action_std[:original_batch_size]
+                    entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -785,23 +804,31 @@ class AMP_PPO:
                 ),
                 dim=0,
             )
-            discriminator_output = self.discriminator(discriminator_input)
-            policy_d, expert_d = (
-                discriminator_output[:B_pol],
-                discriminator_output[B_pol:],
-            )
+            # Discriminator forward + AMP/gradient-penalty losses under the same opt-in
+            # bfloat16 autocast (no-op when disabled). The R1 gradient penalty's double
+            # backward is autocast-safe: the BCE terms and penalty promote to FP32, so
+            # only the discriminator matmuls run in bf16.
+            with torch.amp.autocast(
+                device_type=self._autocast_device_type,
+                enabled=self.use_mixed_precision,
+                dtype=torch.bfloat16,
+            ):
+                discriminator_output = self.discriminator(discriminator_input)
+                policy_d, expert_d = (
+                    discriminator_output[:B_pol],
+                    discriminator_output[B_pol:],
+                )
 
-            # Compute discriminator losses
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d=policy_d,
-                expert_d=expert_d,
-                sample_amp_expert=(expert_state, expert_next_state),
-                sample_amp_policy=(policy_state, policy_next_state),
-                lambda_=10,
-            )
+                amp_loss, grad_pen_loss = self.discriminator.compute_loss(
+                    policy_d=policy_d,
+                    expert_d=expert_d,
+                    sample_amp_expert=(expert_state, expert_next_state),
+                    sample_amp_policy=(policy_state, policy_next_state),
+                    lambda_=10,
+                )
 
-            # The final loss combines the PPO loss with AMP losses.
-            loss = ppo_loss + (amp_loss + grad_pen_loss)
+                # The final loss combines the PPO loss with AMP losses.
+                loss = ppo_loss + (amp_loss + grad_pen_loss)
 
             # Backpropagation and optimizer step.
             self.optimizer.zero_grad()
