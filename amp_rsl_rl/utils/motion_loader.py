@@ -8,12 +8,8 @@ import inspect
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Dict, Optional, Any
 from dataclasses import dataclass
-from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS
 
-if RSL_RL_V3_3_PLUS:
-    from rsl_rl.utils import resolve_callable
-else:
-    from rsl_rl.utils import string_to_callable as resolve_callable
+from rsl_rl.utils import resolve_callable
 
 import torch
 import numpy as np
