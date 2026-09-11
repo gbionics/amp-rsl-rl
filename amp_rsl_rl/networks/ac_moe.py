@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from amp_rsl_rl.utils._compat import EmpiricalNormalization
+from rsl_rl.models import MLPModel
 from rsl_rl.utils import resolve_nn_activation
 
 
@@ -70,6 +71,59 @@ class ActorMoE(nn.Module):
         gate_logits = self.gate(x)  # [batch, K]
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
         return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
+
+
+class MoEModel(MLPModel):
+    """rsl-rl v5.5.0 :class:`MLPModel` whose trunk is a Mixture-of-Experts network.
+
+    Drop-in replacement for ``MLPModel`` as an actor (or critic) model: it selects
+    and normalizes the configured observation groups exactly like ``MLPModel``,
+    but routes the latent through a :class:`ActorMoE` instead of a plain MLP. It
+    is selected via ``class_name`` in the actor/critic configuration.
+    """
+
+    def __init__(
+        self,
+        obs,
+        obs_groups,
+        obs_set: str,
+        output_dim: int,
+        hidden_dims=(256, 256, 256),
+        activation: str = "elu",
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None,
+        num_experts: int = 4,
+        gate_hidden_dims: list[int] | None = None,
+    ) -> None:
+        super().__init__(
+            obs,
+            obs_groups,
+            obs_set,
+            output_dim,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            obs_normalization=obs_normalization,
+            distribution_cfg=distribution_cfg,
+        )
+        # Output width the trunk must produce (distribution may need 2x for std).
+        mlp_output_dim = (
+            self.distribution.input_dim if self.distribution is not None else output_dim
+        )
+        hidden = list(hidden_dims)
+        self.mlp = ActorMoE(
+            obs_dim=self._get_latent_dim(),
+            act_dim=mlp_output_dim,
+            hidden_dims=hidden,
+            num_experts=num_experts,
+            gate_hidden_dims=gate_hidden_dims if gate_hidden_dims is not None else hidden[:-1],
+            activation=activation,
+        )
+        if self.distribution is not None:
+            try:
+                self.distribution.init_mlp_weights(self.mlp)
+            except (AttributeError, IndexError, TypeError):
+                # MoE trunk is not a plain nn.Sequential; skip distribution-specific init.
+                pass
 
 
 class ActorCriticMoE(nn.Module):

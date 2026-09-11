@@ -11,12 +11,8 @@ from torch import autograd
 from torch.nn import functional as F
 from amp_rsl_rl.utils._compat import EmpiricalNormalization
 from amp_rsl_rl.utils.motion_loader import _call_augmentation_func
-from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS
 
-if RSL_RL_V3_3_PLUS:
-    from rsl_rl.utils import resolve_callable
-else:
-    from rsl_rl.utils import string_to_callable as resolve_callable
+from rsl_rl.utils import resolve_callable
 
 
 class Discriminator(nn.Module):

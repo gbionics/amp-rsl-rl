@@ -18,13 +18,15 @@ from mlflow.utils.mlflow_tags import (
 )
 from torch.utils.tensorboard import SummaryWriter
 
+from rsl_rl.utils.log_writer import LogWriter
+
 try:
     import git as _git
 except ImportError:
     _git = None
 
 
-class MLflowSummaryWriter(SummaryWriter):
+class MLflowSummaryWriter(SummaryWriter, LogWriter):
     """Summary writer for MLflow tracking.
 
     This class is a drop-in replacement for :class:`WandbSummaryWriter`.
@@ -206,11 +208,9 @@ class MLflowSummaryWriter(SummaryWriter):
     def store_config(
         self,
         env_cfg: dict | object,
-        runner_cfg: dict,
-        alg_cfg: dict,
-        policy_cfg: dict,
+        train_cfg: dict,
     ) -> None:
-        """Persist configuration dicts as MLflow params."""
+        """Persist configuration dicts as MLflow params (rsl-rl LogWriter API)."""
 
         def _flatten(d: dict, prefix: str = "") -> dict:
             """Flatten a nested dict into dot-separated keys."""
@@ -235,9 +235,7 @@ class MLflowSummaryWriter(SummaryWriter):
                 except mlflow.exceptions.MlflowException:
                     pass  # param already logged – ignore
 
-        _safe_log_params(_flatten(runner_cfg, "runner_cfg"))
-        _safe_log_params(_flatten(policy_cfg, "policy_cfg"))
-        _safe_log_params(_flatten(alg_cfg, "alg_cfg"))
+        _safe_log_params(_flatten(train_cfg, "train_cfg"))
 
         try:
             env_dict = (
@@ -246,15 +244,6 @@ class MLflowSummaryWriter(SummaryWriter):
             _safe_log_params(_flatten(env_dict, "env_cfg"))
         except Exception:
             warnings.warn("Could not log env_cfg to MLflow params.")
-
-    def log_config(
-        self,
-        env_cfg: dict | object,
-        runner_cfg: dict,
-        alg_cfg: dict,
-        policy_cfg: dict,
-    ) -> None:
-        self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
 
     # ------------------------------------------------------------------
     # Scalar logging

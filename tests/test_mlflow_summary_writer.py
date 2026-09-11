@@ -282,19 +282,20 @@ class TestStoreConfig:
         runner_cfg = {"lr": 0.001, "nested": {"a": 1}}
         policy_cfg = {"hidden": 256}
         alg_cfg = {"gamma": 0.99}
+        train_cfg = {**runner_cfg, "policy": policy_cfg, "algorithm": alg_cfg}
 
         # env_cfg as a plain dict (fallback path via asdict will fail, but
         # the writer should still swallow it gracefully via the except branch)
         env_cfg = {"num_envs": 4096}
 
-        writer.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
+        writer.store_config(env_cfg, train_cfg)
 
         # Check that flat keys were logged
         logged_keys = {call.args[0] for call in _fake_mlflow.log_param.call_args_list}
-        assert "runner_cfg.lr" in logged_keys
-        assert "runner_cfg.nested.a" in logged_keys
-        assert "policy_cfg.hidden" in logged_keys
-        assert "alg_cfg.gamma" in logged_keys
+        assert "train_cfg.lr" in logged_keys
+        assert "train_cfg.nested.a" in logged_keys
+        assert "train_cfg.policy.hidden" in logged_keys
+        assert "train_cfg.algorithm.gamma" in logged_keys
 
 
 class TestStop:
