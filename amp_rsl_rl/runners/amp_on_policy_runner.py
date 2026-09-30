@@ -116,7 +116,8 @@ class AMPOnPolicyRunner:
     - "dataset": dictionary forwarded to `AMPLoader`, containing at least:
         * "amp_data_path": folder with the `.npy` expert datasets
         * "datasets": mapping of dataset name -> sampling weight (floats)
-        * "slow_down_factor": slowdown applied to real motion data to match sim dynamics
+        * "slow_down_factor": slowdown applied to real motion data (e.g. 2.0 = twice as slow),
+          either a scalar or one value per dataset in the order of "datasets"
         * "velocity_representation": (optional) "body_fixed" or "mixed" — frame convention
           for base velocities in discriminator observations. Default: "body_fixed"
     - "num_steps_per_env": rollout horizon per environment
@@ -511,7 +512,9 @@ class AMPOnPolicyRunner:
                 self.alg.compute_returns(obs)
 
             # Single synchronization point for the whole rollout.
-            mean_style_reward_log = mean_style_reward_log.item() / self.num_steps_per_env
+            mean_style_reward_log = (
+                mean_style_reward_log.item() / self.num_steps_per_env
+            )
             mean_task_reward_log = mean_task_reward_log.item() / self.num_steps_per_env
 
             (
