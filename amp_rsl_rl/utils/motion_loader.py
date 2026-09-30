@@ -6,7 +6,7 @@
 from enum import Enum
 import inspect
 from pathlib import Path
-from typing import List, Union, Tuple, Generator, Dict, Optional, Any
+from typing import List, Union, Tuple, Generator, Dict, Optional, Any, Sequence
 from dataclasses import dataclass
 from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS
 
@@ -271,7 +271,9 @@ class AMPLoader:
         dataset_path_root: Directory containing the .npy motion files
         datasets: Dictionary mapping dataset names (without extension) to sampling weights (floats)
         simulation_dt: Timestep used by the simulator
-        slow_down_factor: Integer factor to slow down original data
+        slow_down_factor: Factor to slow down the original data (e.g. 2.0 = twice as slow).
+            Either a scalar applied to every dataset or a sequence with one value per
+            dataset, in the same order as `datasets`.
         expected_joint_names: (Optional) override for joint ordering
     """
 
@@ -281,7 +283,7 @@ class AMPLoader:
         dataset_path_root: Path,
         datasets: Dict[str, float],
         simulation_dt: float,
-        slow_down_factor: int,
+        slow_down_factor: Union[float, Sequence[float]],
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
@@ -309,6 +311,20 @@ class AMPLoader:
         dataset_names = list(datasets.keys())
         dataset_weights = list(datasets.values())
 
+        if np.ndim(slow_down_factor) == 0:
+            slow_down_factors = [float(slow_down_factor)] * len(dataset_names)
+        else:
+            slow_down_factors = [float(f) for f in slow_down_factor]
+            if len(slow_down_factors) != len(dataset_names):
+                raise ValueError(
+                    f"slow_down_factor has {len(slow_down_factors)} values but "
+                    f"{len(dataset_names)} datasets were given."
+                )
+        if any(f <= 0 for f in slow_down_factors):
+            raise ValueError(
+                f"slow_down_factor values must be > 0, got {slow_down_factors}."
+            )
+
         # ─── Build union of all joint names if not provided ───
         if expected_joint_names is None:
             joint_union: List[str] = []
@@ -325,12 +341,12 @@ class AMPLoader:
 
         # Load and process each dataset into MotionData
         self.motion_data: List[MotionData] = []
-        for dataset_name in dataset_names:
+        for dataset_name, dataset_slow_down in zip(dataset_names, slow_down_factors):
             dataset_path = dataset_path_root / f"{dataset_name}.npy"
             md = self.load_data(
                 dataset_path,
                 simulation_dt,
-                slow_down_factor,
+                dataset_slow_down,
                 expected_joint_names,
             )
             self.motion_data.append(md)
@@ -455,7 +471,7 @@ class AMPLoader:
         self,
         dataset_path: Path,
         simulation_dt: float,
-        slow_down_factor: int = 1,
+        slow_down_factor: float = 1.0,
         expected_joint_names: Union[List[str], None] = None,
     ) -> MotionData:
         """
@@ -488,7 +504,7 @@ class AMPLoader:
             fps = float(data["fps"].reshape(-1)[0])
         else:
             fps = float(data["fps"])
-        dt = 1.0 / fps / float(slow_down_factor)
+        dt = float(slow_down_factor) / fps
         T = len(jp_list)
         t_orig = np.linspace(0, T * dt, T)
         T_new = int(T * dt / simulation_dt)
