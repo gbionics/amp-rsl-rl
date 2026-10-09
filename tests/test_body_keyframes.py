@@ -16,7 +16,6 @@ from scipy.spatial.transform import Rotation
 
 from amp_rsl_rl.utils.motion_loader import AMPLoader, MotionData, VelocityRepresentation
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -34,7 +33,13 @@ def _create_synthetic_dataset(
     if joint_names is None:
         joint_names = [f"joint_{i}" for i in range(n_joints)]
     if body_links_list is None:
-        body_links_list = ["root_link", "left_knee", "right_knee", "left_foot", "right_foot"]
+        body_links_list = [
+            "root_link",
+            "left_knee",
+            "right_knee",
+            "left_foot",
+            "right_foot",
+        ]
 
     n_bodies = len(body_links_list)
 
@@ -153,7 +158,12 @@ class TestBackwardCompatibility:
             datasets={"motion_with_bodies": 1.0},
             simulation_dt=0.02,
             slow_down_factor=1,
-            amp_obs_components=["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"],
+            amp_obs_components=[
+                "joint_pos",
+                "joint_vel",
+                "base_lin_vel",
+                "base_ang_vel",
+            ],
         )
         assert torch.allclose(loader_default.all_obs, loader_explicit.all_obs)
         assert torch.allclose(loader_default.all_next_obs, loader_explicit.all_next_obs)
@@ -178,10 +188,19 @@ class TestBackwardCompatibility:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=[
-                "joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel",
+                "joint_pos",
+                "joint_vel",
+                "base_lin_vel",
+                "base_ang_vel",
                 "body_pos_b",
             ],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # Reset state: quat(4) + joint_pos(6) + joint_vel(6) + base_lin_vel(3) + base_ang_vel(3) = 22
@@ -203,7 +222,13 @@ class TestBodyKeyframeObs:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=["body_pos_b"],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # 5 bodies - 1 anchor = 4 non-anchor bodies * 3 = 12
@@ -218,7 +243,13 @@ class TestBodyKeyframeObs:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=["body_ori_b"],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # 4 non-anchor bodies * 6 = 24
@@ -233,7 +264,13 @@ class TestBodyKeyframeObs:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=["body_lin_vel_b"],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # 4 non-anchor bodies * 3 = 12
@@ -248,7 +285,13 @@ class TestBodyKeyframeObs:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=["body_ang_vel_b"],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # 4 non-anchor bodies * 3 = 12
@@ -263,10 +306,20 @@ class TestBodyKeyframeObs:
             simulation_dt=0.02,
             slow_down_factor=1,
             amp_obs_components=[
-                "joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel",
-                "body_pos_b", "body_ori_b",
+                "joint_pos",
+                "joint_vel",
+                "base_lin_vel",
+                "base_ang_vel",
+                "body_pos_b",
+                "body_ori_b",
             ],
-            body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
+            body_links_names=[
+                "root_link",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            ],
             anchor_body_name="root_link",
         )
         # joint_pos(6) + joint_vel(6) + base_lin_vel(3) + base_ang_vel(3)
@@ -413,7 +466,9 @@ class TestValidation:
             (["root_link"], "at least one body besides the anchor"),
         ],
     )
-    def test_invalid_body_links_names(self, dataset_with_bodies, body_links_names, match):
+    def test_invalid_body_links_names(
+        self, dataset_with_bodies, body_links_names, match
+    ):
         with pytest.raises(ValueError, match=match):
             AMPLoader(
                 device="cpu",
@@ -479,7 +534,9 @@ class TestNumericalCorrectness:
         )
 
         # body_pos_b for a body coincident with anchor should be ~0
-        assert torch.allclose(loader.all_obs, torch.zeros_like(loader.all_obs), atol=1e-5)
+        assert torch.allclose(
+            loader.all_obs, torch.zeros_like(loader.all_obs), atol=1e-5
+        )
 
     def test_body_ori_b_identity_when_same_orientation(self, tmpdir):
         """When body has same orientation as anchor, the 6D repr should be [1,0,0, 0,1,0]."""
@@ -525,9 +582,9 @@ class TestNumericalCorrectness:
         # Identity rotation → first 2 cols of I = [1,0,0, 0,1,0]
         expected = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float32)
         for i in range(loader.all_obs.shape[0]):
-            assert torch.allclose(loader.all_obs[i], expected, atol=1e-5), (
-                f"Frame {i}: {loader.all_obs[i]} != {expected}"
-            )
+            assert torch.allclose(
+                loader.all_obs[i], expected, atol=1e-5
+            ), f"Frame {i}: {loader.all_obs[i]} != {expected}"
 
     def test_non_anchor_body_at_known_offset(self, tmpdir):
         """Body at a known offset from anchor should produce correct relative position."""
@@ -577,9 +634,9 @@ class TestNumericalCorrectness:
 
         expected = torch.tensor(offset, dtype=torch.float32)
         for i in range(loader.all_obs.shape[0]):
-            assert torch.allclose(loader.all_obs[i], expected, atol=1e-4), (
-                f"Frame {i}: {loader.all_obs[i]} != {expected}"
-            )
+            assert torch.allclose(
+                loader.all_obs[i], expected, atol=1e-4
+            ), f"Frame {i}: {loader.all_obs[i]} != {expected}"
 
     @staticmethod
     def _rotating_anchor_dataset(tmpdir, n_frames=200, fps=100.0):
@@ -588,7 +645,9 @@ class TestNumericalCorrectness:
         t = np.arange(n_frames) / fps
         rot_a = Rotation.from_euler("z", 0.3 * t[:, None])
         pos_a = np.stack([0.2 * t, 0.1 * t, np.full_like(t, 0.9)], axis=1)
-        rel_pos = np.stack([0.2 + 0.1 * t, -0.1 * np.ones_like(t), -0.5 * np.ones_like(t)], axis=1)
+        rel_pos = np.stack(
+            [0.2 + 0.1 * t, -0.1 * np.ones_like(t), -0.5 * np.ones_like(t)], axis=1
+        )
         rot_b = rot_a * Rotation.from_euler("x", 0.5 * t[:, None])
         pos_b = pos_a + rot_a.apply(rel_pos)
 
@@ -654,7 +713,11 @@ class TestNumericalCorrectness:
             amp_obs_components=["body_pos_b"],
             anchor_body_name="root_link",
         )
-        a = AMPLoader(body_links_names=["root_link", "left_knee", "right_foot"], **kwargs)
-        b = AMPLoader(body_links_names=["right_foot", "root_link", "left_knee"], **kwargs)
+        a = AMPLoader(
+            body_links_names=["root_link", "left_knee", "right_foot"], **kwargs
+        )
+        b = AMPLoader(
+            body_links_names=["right_foot", "root_link", "left_knee"], **kwargs
+        )
         assert torch.allclose(a.all_obs[:, :3], b.all_obs[:, 3:])
         assert torch.allclose(a.all_obs[:, 3:], b.all_obs[:, :3])
