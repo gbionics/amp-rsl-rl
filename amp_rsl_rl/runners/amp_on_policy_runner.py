@@ -123,6 +123,10 @@ class AMPOnPolicyRunner:
           either a scalar or one value per dataset in the order of "datasets"
         * "velocity_representation": (optional) "body_fixed" or "mixed" — frame convention
           for base velocities in discriminator observations. Default: "body_fixed"
+        * "amp_obs_components": (optional) ordered list of discriminator observation
+          components. It must match the order of the terms in `observations["amp"]`.
+        * "body_links_names" / "anchor_body_name": (optional) body keyframes to use when
+          "amp_obs_components" contains any of the `body_*` components.
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
     - "empirical_normalization": (deprecated) legacy flag mirrored to `policy.actor_obs_normalization`
@@ -316,6 +320,16 @@ class AMPOnPolicyRunner:
             body_links_names=self.dataset_cfg.get("body_links_names"),
             anchor_body_name=self.dataset_cfg.get("anchor_body_name"),
         )
+
+        num_dataset_amp_obs = amp_data.all_obs.shape[1]
+        if num_dataset_amp_obs != num_amp_obs:
+            raise ValueError(
+                f"The AMP observation of the environment has {num_amp_obs} elements while "
+                f"the expert dataset produces {num_dataset_amp_obs} elements "
+                f"(amp_obs_components={self.dataset_cfg.get('amp_obs_components')}, "
+                f"body_links_names={self.dataset_cfg.get('body_links_names')}). Make sure "
+                "the env 'amp' observation group and the dataset configuration match."
+            )
 
         self.discriminator = Discriminator(
             input_dim=num_amp_obs

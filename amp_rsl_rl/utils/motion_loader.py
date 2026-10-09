@@ -111,6 +111,8 @@ def _call_augmentation_func(
 
 
 _DEFAULT_OBS_COMPONENTS = ["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"]
+_BODY_OBS_COMPONENTS = ["body_pos_b", "body_ori_b", "body_lin_vel_b", "body_ang_vel_b"]
+_VALID_OBS_COMPONENTS = _DEFAULT_OBS_COMPONENTS + _BODY_OBS_COMPONENTS
 
 
 @dataclass
@@ -130,10 +132,13 @@ class MotionData:
         - base_lin_velocities_local: linear velocity in local (body) frame
         - base_ang_velocities_local: (currently zeros)
         - base_quat: orientation quaternion as torch.Tensor in wxyz order
-        - body_pos_b: (optional) relative body positions w.r.t. anchor, shape (T, (N_bodies-1)*3)
-        - body_ori_b: (optional) relative body orientations w.r.t. anchor (6D repr), shape (T, (N_bodies-1)*6)
-        - body_lin_vel_b: (optional) relative body linear velocities, shape (T, (N_bodies-1)*3)
-        - body_ang_vel_b: (optional) relative body angular velocities, shape (T, (N_bodies-1)*3)
+        - body_pos_b: (optional) body positions relative to the anchor, expressed in the
+          anchor frame, i.e. R_a^T (p_b - p_a), shape (T, (N_bodies-1)*3)
+        - body_ori_b: (optional) body orientations relative to the anchor, R_a^T R_b, as 6D
+          representation [first column, second column], shape (T, (N_bodies-1)*6)
+        - body_lin_vel_b: (optional) time derivative of body_pos_b, shape (T, (N_bodies-1)*3)
+        - body_ang_vel_b: (optional) angular velocity of the body relative to the anchor,
+          expressed in the anchor frame, i.e. R_a^T (w_b - w_a), shape (T, (N_bodies-1)*3)
 
     Notes:
         - The quaternion is expected in the dataset as `xyzw` format (SciPy default),
@@ -343,26 +348,43 @@ class AMPLoader:
             dataset_path_root = Path(dataset_path_root)
 
         # ─── Validate body keyframe configuration ───
-        _body_components = {"body_pos_b", "body_ori_b", "body_lin_vel_b", "body_ang_vel_b"}
-        self._needs_body_keyframes = (
-            self.obs_components is not None
-            and bool(_body_components & set(self.obs_components))
-        )
+        if self.obs_components is not None:
+            self.obs_components = list(self.obs_components)
+            unknown = [c for c in self.obs_components if c not in _VALID_OBS_COMPONENTS]
+            if unknown:
+                raise ValueError(
+                    f"AMP observation component(s) {unknown} not available. "
+                    f"Valid components: {_VALID_OBS_COMPONENTS}"
+                )
+        requested_body_components = [
+            c for c in (self.obs_components or []) if c in _BODY_OBS_COMPONENTS
+        ]
+        self._needs_body_keyframes = bool(requested_body_components)
         if self._needs_body_keyframes:
             if body_links_names is None:
                 raise ValueError(
                     "body_links_names must be provided when using body keyframe "
-                    f"observation components: {_body_components & set(self.obs_components)}"
+                    f"observation components: {requested_body_components}"
                 )
             if anchor_body_name is None:
                 raise ValueError(
                     "anchor_body_name must be provided when using body keyframe "
                     "observation components."
                 )
+            body_links_names = list(body_links_names)
             if anchor_body_name not in body_links_names:
                 raise ValueError(
                     f"anchor_body_name '{anchor_body_name}' must be present in "
                     f"body_links_names: {body_links_names}"
+                )
+            if len(set(body_links_names)) != len(body_links_names):
+                raise ValueError(
+                    f"body_links_names contains duplicates: {body_links_names}"
+                )
+            if len(body_links_names) < 2:
+                raise ValueError(
+                    "body_links_names must contain at least one body besides the "
+                    f"anchor '{anchor_body_name}'."
                 )
         self.body_links_names = body_links_names
         self.anchor_body_name = anchor_body_name
@@ -641,10 +663,13 @@ class AMPLoader:
         body_lin_vel_b = None
         body_ang_vel_b = None
 
-        if self._needs_body_keyframes and body_links_names is not None:
-            if "body_links_list" not in data:
+        if self._needs_body_keyframes:
+            required_keys = ("body_links_list", "body_links_pos_w", "body_links_quat_w")
+            missing_keys = [k for k in required_keys if k not in data]
+            if missing_keys:
                 raise KeyError(
-                    f"Dataset '{dataset_path}' does not contain 'body_links_list'. "
+                    f"Dataset '{dataset_path}' does not contain "
+                    f"{', '.join(repr(k) for k in missing_keys)}. "
                     "Body keyframe observation components require datasets with "
                     "'body_links_list', 'body_links_pos_w', and 'body_links_quat_w' keys."
                 )
@@ -662,69 +687,45 @@ class AMPLoader:
                 body_idx_map.append(dataset_body_names.index(name))
 
             # Extract body positions and quaternions (xyzw format in dataset)
-            raw_body_pos_w = np.array(
-                data["body_links_pos_w"][:, body_idx_map, :], dtype=np.float64
-            )
-            raw_body_quat_xyzw = np.array(
-                data["body_links_quat_w"][:, body_idx_map, :], dtype=np.float64
-            )
+            raw_body_pos_w = np.asarray(data["body_links_pos_w"], dtype=np.float64)[
+                :, body_idx_map, :
+            ]
+            raw_body_quat_xyzw = np.asarray(
+                data["body_links_quat_w"], dtype=np.float64
+            )[:, body_idx_map, :]
 
-            # Resample body positions: shape (T_new, N_bodies, 3)
-            n_bodies = len(body_links_names)
-            resampled_body_pos_w = np.zeros((T_new, n_bodies, 3), dtype=np.float64)
-            for b in range(n_bodies):
-                resampled_body_pos_w[:, b, :] = self._resample_data_Rn(
-                    raw_body_pos_w[:, b, :], t_orig, t_new
-                )
+            # (T_new, N_bodies, 3) positions and one SLERP-resampled Rotation per body
+            body_pos_w = self._resample_data_Rn(raw_body_pos_w, t_orig, t_new)
+            body_rot_w = [
+                self._resample_data_SO3(raw_body_quat_xyzw[:, b, :], t_orig, t_new)
+                for b in range(len(body_links_names))
+            ]
 
-            # Resample body quaternions via SLERP: shape (T_new, N_bodies, 4) as Rotation
-            resampled_body_rotations = []  # list of Rotation objects, one per body
-            for b in range(n_bodies):
-                rot_b = self._resample_data_SO3(
-                    raw_body_quat_xyzw[:, b, :], t_orig, t_new
-                )
-                resampled_body_rotations.append(rot_b)
-
-            # Find anchor body index
             anchor_idx = body_links_names.index(anchor_body_name)
+            anchor_rot_inv = body_rot_w[anchor_idx].inv()
+            anchor_pos_w = body_pos_w[:, anchor_idx, :]
 
-            # Get anchor rotation matrices: shape (T_new, 3, 3)
-            anchor_rot_matrices = resampled_body_rotations[anchor_idx].as_matrix()
-            # Anchor positions: shape (T_new, 3)
-            anchor_pos = resampled_body_pos_w[:, anchor_idx, :]
+            pos_b, ori_b, lin_vel_b, ang_vel_b = [], [], [], []
+            for b, rot_b in enumerate(body_rot_w):
+                if b == anchor_idx:
+                    continue
+                # R_a^T (p_b - p_a) and R_a^T R_b
+                rel_pos = anchor_rot_inv.apply(body_pos_w[:, b, :] - anchor_pos_w)
+                rel_rot = anchor_rot_inv * rot_b
+                rel_mat = rel_rot.as_matrix()
 
-            # Compute relative transforms for non-anchor bodies
-            non_anchor_indices = [i for i in range(n_bodies) if i != anchor_idx]
-            n_non_anchor = len(non_anchor_indices)
+                pos_b.append(rel_pos)
+                ori_b.append(np.concatenate([rel_mat[:, :, 0], rel_mat[:, :, 1]], axis=1))
+                lin_vel_b.append(self._compute_raw_derivative(rel_pos, simulation_dt))
+                # Left-trivialized derivative of R_a^T R_b equals R_a^T (w_b - w_a)
+                ang_vel_b.append(
+                    self._compute_ang_vel(rel_rot, simulation_dt, local=False)
+                )
 
-            # body_pos_b: relative position in anchor frame, shape (T_new, n_non_anchor, 3)
-            rel_pos_b = np.zeros((T_new, n_non_anchor, 3), dtype=np.float64)
-            # body_ori_b: relative orientation as 6D (first 2 cols of rot matrix),
-            # shape (T_new, n_non_anchor, 6)
-            rel_ori_b = np.zeros((T_new, n_non_anchor, 6), dtype=np.float64)
-
-            for i, body_idx in enumerate(non_anchor_indices):
-                body_pos = resampled_body_pos_w[:, body_idx, :]
-                body_rot_matrices = resampled_body_rotations[body_idx].as_matrix()
-
-                for t in range(T_new):
-                    R_anchor_T = anchor_rot_matrices[t].T
-                    # Relative position: R_anchor^T @ (p_body - p_anchor)
-                    rel_pos_b[t, i, :] = R_anchor_T @ (body_pos[t] - anchor_pos[t])
-                    # Relative orientation: R_anchor^T @ R_body
-                    R_rel = R_anchor_T @ body_rot_matrices[t]
-                    # 6D representation: first 2 columns of rotation matrix
-                    rel_ori_b[t, i, :3] = R_rel[:, 0]
-                    rel_ori_b[t, i, 3:] = R_rel[:, 1]
-
-            # Compute velocities via numerical differentiation
-            rel_pos_b_flat = rel_pos_b.reshape(T_new, n_non_anchor * 3)
-            rel_ori_b_flat = rel_ori_b.reshape(T_new, n_non_anchor * 6)
-
-            body_pos_b = rel_pos_b_flat
-            body_ori_b = rel_ori_b_flat
-            body_lin_vel_b = self._compute_raw_derivative(rel_pos_b_flat, simulation_dt)
-            body_ang_vel_b = self._compute_raw_derivative(rel_ori_b_flat, simulation_dt)
+            body_pos_b = np.concatenate(pos_b, axis=1)
+            body_ori_b = np.concatenate(ori_b, axis=1)
+            body_lin_vel_b = np.concatenate(lin_vel_b, axis=1)
+            body_ang_vel_b = np.concatenate(ang_vel_b, axis=1)
         # ─────────────────────────────────────────────────
 
         return MotionData(

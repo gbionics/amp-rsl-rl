@@ -240,7 +240,7 @@ class TestBodyKeyframeObs:
         assert loader.all_obs.shape[1] == 12
 
     def test_body_ang_vel_b_dimensions(self, dataset_with_bodies):
-        """body_ang_vel_b should have (N_bodies-1)*6 dimensions (derivative of 6D repr)."""
+        """body_ang_vel_b should have (N_bodies-1)*3 dimensions."""
         loader = AMPLoader(
             device="cpu",
             dataset_path_root=dataset_with_bodies,
@@ -251,8 +251,8 @@ class TestBodyKeyframeObs:
             body_links_names=["root_link", "left_knee", "right_knee", "left_foot", "right_foot"],
             anchor_body_name="root_link",
         )
-        # body_ang_vel_b is derivative of body_ori_b (6D repr), so 4*6 = 24
-        assert loader.all_obs.shape[1] == 24
+        # 4 non-anchor bodies * 3 = 12
+        assert loader.all_obs.shape[1] == 12
 
     def test_combined_components(self, dataset_with_bodies):
         """All components together should sum dimensions correctly."""
@@ -404,6 +404,26 @@ class TestValidation:
                 simulation_dt=0.02,
                 slow_down_factor=1,
                 amp_obs_components=["nonexistent_component"],
+            )
+
+    @pytest.mark.parametrize(
+        "body_links_names, match",
+        [
+            (["root_link", "left_knee", "left_knee"], "duplicates"),
+            (["root_link"], "at least one body besides the anchor"),
+        ],
+    )
+    def test_invalid_body_links_names(self, dataset_with_bodies, body_links_names, match):
+        with pytest.raises(ValueError, match=match):
+            AMPLoader(
+                device="cpu",
+                dataset_path_root=dataset_with_bodies,
+                datasets={"motion_with_bodies": 1.0},
+                simulation_dt=0.02,
+                slow_down_factor=1,
+                amp_obs_components=["body_pos_b"],
+                body_links_names=body_links_names,
+                anchor_body_name="root_link",
             )
 
 
@@ -560,3 +580,81 @@ class TestNumericalCorrectness:
             assert torch.allclose(loader.all_obs[i], expected, atol=1e-4), (
                 f"Frame {i}: {loader.all_obs[i]} != {expected}"
             )
+
+    @staticmethod
+    def _rotating_anchor_dataset(tmpdir, n_frames=200, fps=100.0):
+        """Anchor yawing at 0.3 rad/s while the body rolls at 0.5 rad/s and slides
+        along the anchor x axis at 0.1 m/s, both measured in the anchor frame."""
+        t = np.arange(n_frames) / fps
+        rot_a = Rotation.from_euler("z", 0.3 * t[:, None])
+        pos_a = np.stack([0.2 * t, 0.1 * t, np.full_like(t, 0.9)], axis=1)
+        rel_pos = np.stack([0.2 + 0.1 * t, -0.1 * np.ones_like(t), -0.5 * np.ones_like(t)], axis=1)
+        rot_b = rot_a * Rotation.from_euler("x", 0.5 * t[:, None])
+        pos_b = pos_a + rot_a.apply(rel_pos)
+
+        data = {
+            "joints_list": ["j0"],
+            "joint_positions": np.zeros((n_frames, 1)),
+            "root_position": pos_a,
+            "root_quaternion": rot_a.as_quat(),
+            "fps": np.array([fps]),
+            "body_links_list": ["anchor", "body1"],
+            "body_links_pos_w": np.stack([pos_a, pos_b], axis=1),
+            "body_links_quat_w": np.stack([rot_a.as_quat(), rot_b.as_quat()], axis=1),
+        }
+        np.save(str(tmpdir / "rot.npy"), data)
+        return t, rel_pos
+
+    def test_relative_pose_with_rotating_anchor(self, tmpdir):
+        """body_pos_b / body_ori_b must be expressed in the (rotating) anchor frame."""
+        self._rotating_anchor_dataset(tmpdir)
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=tmpdir,
+            datasets={"rot": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            amp_obs_components=["body_pos_b", "body_ori_b"],
+            body_links_names=["anchor", "body1"],
+            anchor_body_name="anchor",
+        )
+        obs = loader.all_obs.numpy()
+        assert np.allclose(obs[:, 1:3], [-0.1, -0.5], atol=1e-5)
+        # Relative orientation is a pure roll: first column must stay [1, 0, 0]
+        assert np.allclose(obs[:, 3:6], [1.0, 0.0, 0.0], atol=1e-5)
+        roll = np.arctan2(obs[:, 8], obs[:, 7])
+        # rtol absorbs the small time-grid rescaling of the loader resampling
+        assert np.allclose(np.diff(roll) / 0.02, 0.5, rtol=2e-2)
+
+    def test_relative_velocities_with_rotating_anchor(self, tmpdir):
+        """body_lin_vel_b is d/dt body_pos_b and body_ang_vel_b is R_a^T (w_b - w_a)."""
+        self._rotating_anchor_dataset(tmpdir)
+        loader = AMPLoader(
+            device="cpu",
+            dataset_path_root=tmpdir,
+            datasets={"rot": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            amp_obs_components=["body_lin_vel_b", "body_ang_vel_b"],
+            body_links_names=["anchor", "body1"],
+            anchor_body_name="anchor",
+        )
+        obs = loader.all_obs.numpy()
+        assert np.allclose(obs[:, 0:3], [0.1, 0.0, 0.0], rtol=2e-2, atol=1e-3)
+        assert np.allclose(obs[:, 3:6], [0.5, 0.0, 0.0], rtol=2e-2, atol=1e-3)
+
+    def test_body_order_follows_body_links_names(self, dataset_with_bodies):
+        """Bodies are emitted in the order of body_links_names, not of the dataset."""
+        kwargs = dict(
+            device="cpu",
+            dataset_path_root=dataset_with_bodies,
+            datasets={"motion_with_bodies": 1.0},
+            simulation_dt=0.02,
+            slow_down_factor=1,
+            amp_obs_components=["body_pos_b"],
+            anchor_body_name="root_link",
+        )
+        a = AMPLoader(body_links_names=["root_link", "left_knee", "right_foot"], **kwargs)
+        b = AMPLoader(body_links_names=["right_foot", "root_link", "left_knee"], **kwargs)
+        assert torch.allclose(a.all_obs[:, :3], b.all_obs[:, 3:])
+        assert torch.allclose(a.all_obs[:, 3:], b.all_obs[:, :3])

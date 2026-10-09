@@ -108,9 +108,25 @@ When using body keyframe components, set these in `dataset_cfg`:
 Notes:
 
 - `anchor_body_name` must be present in `body_links_names`.
-- The anchor body is excluded from the final body observation vectors.
+- The anchor body is excluded from the final body observation vectors; the remaining bodies
+  are emitted in the order of `body_links_names`.
 - For backward compatibility, if `amp_obs_components` is not provided, the default is
   `["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"]`.
+- The order of `amp_obs_components` must match the order of the terms in the environment
+  `amp` observation group. The runner raises an error if the sizes differ.
+
+Body components (with `R_a`, `p_a`, `w_a` the anchor orientation, position and angular
+velocity in world frame, and `R_b`, `p_b`, `w_b` the same quantities for a body):
+
+| Component | Size per body | Definition |
+|---|---|---|
+| `body_pos_b` | 3 | `R_a^T (p_b - p_a)` |
+| `body_ori_b` | 6 | first two columns of `R_a^T R_b`, i.e. `[col0, col1]` |
+| `body_lin_vel_b` | 3 | time derivative of `body_pos_b` |
+| `body_ang_vel_b` | 3 | `R_a^T (w_b - w_a)` |
+
+When symmetry augmentation is enabled, the user-provided `amp_dataset_augmentation_func`
+must also mirror these components.
 
 ---
 
