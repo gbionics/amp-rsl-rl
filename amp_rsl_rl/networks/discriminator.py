@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,10 @@ class Discriminator(nn.Module):
         empirical_normalization (bool): Whether to normalize AMP observations empirically before scoring.
         num_frames (int): Number of AMP observations in the input window. The default 2 is the
             classic (state, next state) AMP discriminator.
+        frame_features (Sequence[int], optional): Indices of the AMP observation features the
+            network sees in every frame (default: all of them). The other features are still
+            stored, normalized and mirrored, but dropped before the network, e.g. to hide the joint
+            velocities from a multi-frame discriminator that can infer them from the positions.
     """
 
     def __init__(
@@ -52,6 +56,7 @@ class Discriminator(nn.Module):
         empirical_normalization: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         num_frames: int = 2,
+        frame_features: Optional[Sequence[int]] = None,
     ):
         super().__init__()
 
@@ -65,8 +70,28 @@ class Discriminator(nn.Module):
         self.frame_dim = input_dim // num_frames
         self.reward_scale = reward_scale
         self.reward_clamp_epsilon = reward_clamp_epsilon
+
+        if frame_features is not None:
+            features = sorted(set(int(i) for i in frame_features))
+            if not features or features[0] < 0 or features[-1] >= self.frame_dim:
+                raise ValueError(
+                    f"frame_features must be indices in [0, {self.frame_dim}), got {frame_features}."
+                )
+            self.frame_features: Optional[list[int]] = features
+            self.register_buffer(
+                "_window_features",
+                (
+                    torch.arange(num_frames)[:, None] * self.frame_dim
+                    + torch.tensor(features)
+                ).flatten(),
+                persistent=False,
+            )
+        else:
+            self.frame_features = None
         layers = []
-        curr_in_dim = input_dim
+        curr_in_dim = num_frames * (
+            len(self.frame_features) if self.frame_features else self.frame_dim
+        )
 
         for hidden_dim in hidden_layer_sizes:
             layers.append(nn.Linear(curr_in_dim, hidden_dim))
@@ -137,6 +162,12 @@ class Discriminator(nn.Module):
         """Normalize each AMP frame of ``x`` (..., n * frame_dim)."""
         return self.amp_normalizer(x.reshape(-1, self.frame_dim)).reshape(x.shape)
 
+    def select_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Keep the ``frame_features`` of every frame of ``x`` (..., n * frame_dim)."""
+        if self.frame_features is None:
+            return x
+        return x.index_select(-1, self._window_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the discriminator.
 
@@ -148,7 +179,7 @@ class Discriminator(nn.Module):
         """
 
         # Normalize AMP observations. If not enabled the normalizer is identity.
-        x = self.normalize(x)
+        x = self.select_features(self.normalize(x))
 
         h = self.trunk(x)
         if self.use_minibatch_std:
@@ -276,10 +307,10 @@ class Discriminator(nn.Module):
         Returns:
             Tensor: Gradient penalty value.
         """
-        expert = torch.cat(expert_states, -1)
+        expert = self.select_features(torch.cat(expert_states, -1))
 
         if self.loss_type == "Wasserstein":
-            policy = torch.cat(policy_states, -1)
+            policy = self.select_features(torch.cat(policy_states, -1))
             alpha = torch.rand(expert.size(0), 1, device=expert.device)
             alpha = alpha.expand_as(expert)
             data = alpha * expert + (1 - alpha) * policy

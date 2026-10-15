@@ -328,6 +328,7 @@ class AMPOnPolicyRunner:
             empirical_normalization=self.discriminator_cfg["empirical_normalization"],
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
             num_frames=self.amp_num_frames,
+            frame_features=self.discriminator_cfg.get("frame_features"),
         ).to(self.device)
 
         # Initialize the PPO algorithm

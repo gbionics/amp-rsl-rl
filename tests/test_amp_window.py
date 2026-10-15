@@ -128,3 +128,41 @@ def test_replay_buffer_window_dims():
     buffer.insert(torch.ones(3, 12), torch.zeros(3, 4))
     states, next_states = next(buffer.feed_forward_generator(1, 3))
     assert states.shape == (3, 12) and next_states.shape == (3, 4)
+
+
+def test_discriminator_frame_features_hide_the_other_features():
+    D, n, keep = 5, 3, [0, 1, 4]
+    disc = Discriminator(
+        input_dim=D * n,
+        hidden_layer_sizes=[8],
+        reward_scale=1.0,
+        num_frames=n,
+        frame_features=keep,
+    )
+    assert disc.trunk[0].in_features == n * len(keep)
+    window = torch.randn(16, n * D)
+    selected = disc.select_features(window).reshape(16, n, len(keep))
+    assert torch.equal(selected, window.reshape(16, n, D)[:, :, keep])
+
+    # Changing a hidden feature changes neither the score nor the gradient penalty.
+    other = window.clone().reshape(16, n, D)
+    other[:, :, [2, 3]] += 10.0
+    other = other.reshape(16, n * D)
+    assert torch.allclose(disc(window), disc(other))
+    states = (window[:, : (n - 1) * D], window[:, (n - 1) * D :])
+    other_states = (other[:, : (n - 1) * D], other[:, (n - 1) * D :])
+    assert torch.allclose(
+        disc.compute_grad_pen(states, states),
+        disc.compute_grad_pen(other_states, other_states),
+    )
+
+
+def test_discriminator_rejects_invalid_frame_features():
+    with pytest.raises(ValueError):
+        Discriminator(
+            input_dim=10, hidden_layer_sizes=[8], reward_scale=1.0, frame_features=[5]
+        )
+    with pytest.raises(ValueError):
+        Discriminator(
+            input_dim=10, hidden_layer_sizes=[8], reward_scale=1.0, frame_features=[]
+        )
