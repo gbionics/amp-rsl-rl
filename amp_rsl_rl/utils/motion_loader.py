@@ -275,6 +275,8 @@ class AMPLoader:
             Either a scalar applied to every dataset or a sequence with one value per
             dataset, in the same order as `datasets`.
         expected_joint_names: (Optional) override for joint ordering
+        num_frames: AMP frames in each discriminator sample (2 = state, next state)
+        frame_stride: Simulation steps between consecutive frames of a sample
     """
 
     def __init__(
@@ -287,9 +289,13 @@ class AMPLoader:
         expected_joint_names: Union[List[str], None] = None,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        num_frames: int = 2,
+        frame_stride: int = 1,
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
+        self.num_frames = num_frames
+        self.frame_stride = frame_stride
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
 
@@ -355,21 +361,36 @@ class AMPLoader:
         weights = torch.tensor(dataset_weights, dtype=torch.float32, device=self.device)
         self.dataset_weights = weights / weights.sum()
 
-        # Precompute flat buffers for fast sampling
+        # Precompute flat buffers for fast sampling. A sample is a window of num_frames frames:
+        # obs holds the first num_frames - 1 frames (flattened), next_obs the last one.
+        span = (self.num_frames - 1) * self.frame_stride
+        offsets = torch.arange(self.num_frames, device=self.device) * self.frame_stride
         obs_list, next_obs_list, reset_states = [], [], []
         augmented_lengths: List[int] = []
         original_lengths: List[int] = []
         for data, w in zip(self.motion_data, self.dataset_weights):
             T = len(data)
             idx = torch.arange(T, device=self.device)
-            obs = data.get_amp_dataset_obs(idx, self.velocity_representation)
-            next_idx = torch.clamp(idx + 1, max=T - 1)
-            next_obs = data.get_amp_dataset_obs(next_idx, self.velocity_representation)
+            frames = data.get_amp_dataset_obs(idx, self.velocity_representation)
+            # (state, next state) pairs keep the last frame paired with itself.
+            num_starts = T if span == 1 else T - span
+            if num_starts < 1:
+                raise ValueError(
+                    f"Motion {len(obs_list)} has {T} frames, fewer than the AMP window ({span + 1})."
+                )
+            window = torch.clamp(
+                torch.arange(num_starts, device=self.device)[:, None] + offsets,
+                max=T - 1,
+            )
+            obs = frames[window[:, :-1]].reshape(num_starts, -1)
+            next_obs = frames[window[:, -1]]
 
             if self.symmetry_cfg and self.symmetry_cfg.get(
                 "use_amp_dataset_augmentation", False
             ):
-                obs = self._apply_symmetry(obs=obs, obs_type="amp")
+                obs = self._apply_symmetry(
+                    obs=obs.reshape(-1, frames.shape[1]), obs_type="amp"
+                ).reshape(-1, obs.shape[1])
                 next_obs = self._apply_symmetry(obs=next_obs, obs_type="amp")
 
             obs_list.append(obs)

@@ -295,6 +295,12 @@ class AMPOnPolicyRunner:
 
         # Initialize all the ingredients required for AMP (discriminator, dataset loader)
         num_amp_obs = self._flatten_amp_obs(observations["amp"]).shape[1]
+        # The discriminator scores windows of num_frames AMP observations spaced by frame_stride
+        # policy steps (default: the classic (state, next state) pair).
+        self.amp_num_frames = int(self.discriminator_cfg.get("num_frames", 2))
+        self.amp_frame_stride = int(self.discriminator_cfg.get("frame_stride", 1))
+        if self.amp_num_frames < 2 or self.amp_frame_stride < 1:
+            raise ValueError("AMP windows need num_frames >= 2 and frame_stride >= 1.")
 
         # Resolve velocity representation for discriminator observations
         vel_repr_str = self.dataset_cfg.get("velocity_representation", "body_fixed")
@@ -309,17 +315,19 @@ class AMPOnPolicyRunner:
             expected_joint_names=amp_joint_names,
             velocity_representation=velocity_representation,
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            num_frames=self.amp_num_frames,
+            frame_stride=self.amp_frame_stride,
         )
 
         self.discriminator = Discriminator(
-            input_dim=num_amp_obs
-            * 2,  # the discriminator takes in the concatenation of the current and next observation
+            input_dim=num_amp_obs * self.amp_num_frames,
             hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
             reward_scale=self.discriminator_cfg["reward_scale"],
             device=self.device,
             loss_type=self.discriminator_cfg["loss_type"],
             empirical_normalization=self.discriminator_cfg["empirical_normalization"],
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
+            num_frames=self.amp_num_frames,
         ).to(self.device)
 
         # Initialize the PPO algorithm
@@ -434,7 +442,11 @@ class AMPOnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs = self.env.get_observations().to(self.device)
-        amp_obs = self._flatten_amp_obs(obs["amp"]).clone()
+        # Last (num_frames - 1) * frame_stride AMP observations of each env, oldest first.
+        amp_span = (self.amp_num_frames - 1) * self.amp_frame_stride
+        amp_history = (
+            self._flatten_amp_obs(obs["amp"]).clone().unsqueeze(1).repeat(1, amp_span, 1)
+        )
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -462,6 +474,8 @@ class AMPOnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs)
+                    # First num_frames - 1 frames of the window ending at the next observation.
+                    amp_obs = amp_history[:, :: self.amp_frame_stride].flatten(1)
                     self.alg.act_amp(amp_obs)
                     obs, rewards, dones, extras = self.env.step(
                         actions.to(self.env.device)
@@ -485,7 +499,15 @@ class AMPOnPolicyRunner:
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)
 
-                    amp_obs = next_amp_obs
+                    amp_history = torch.cat(
+                        [amp_history[:, 1:], next_amp_obs.unsqueeze(1)], dim=1
+                    )
+                    # Windows do not span episodes: reset envs restart from their first frame.
+                    reset_ids = dones.nonzero(as_tuple=False).flatten()
+                    if reset_ids.numel() > 0:
+                        amp_history[reset_ids] = (
+                            next_amp_obs[reset_ids].unsqueeze(1).expand(-1, amp_span, -1)
+                        )
 
                     if self.log_dir is not None:
                         if "episode" in extras:

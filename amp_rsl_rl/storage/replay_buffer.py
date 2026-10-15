@@ -25,6 +25,7 @@ class ReplayBuffer:
         obs_dim: int,
         buffer_size: int,
         device: Union[str, torch.device] = "cpu",
+        next_obs_dim: Union[int, None] = None,
     ) -> None:
         """
         Initialize a ReplayBuffer object.
@@ -33,6 +34,8 @@ class ReplayBuffer:
             obs_dim (int): Dimension of the observation space.
             buffer_size (int): Maximum number of transitions to store.
             device (str or torch.device): Torch device where buffers are allocated ('cpu' or 'cuda').
+            next_obs_dim (int, optional): Dimension of the next states, if different from ``obs_dim``
+                (e.g. the states are the first frames of a multi-frame discriminator window).
         """
         self.device = torch.device(device)
         self.buffer_size = buffer_size
@@ -42,7 +45,9 @@ class ReplayBuffer:
             (buffer_size, obs_dim), dtype=torch.float32, device=self.device
         )
         self.next_states = torch.zeros(
-            (buffer_size, obs_dim), dtype=torch.float32, device=self.device
+            (buffer_size, next_obs_dim or obs_dim),
+            dtype=torch.float32,
+            device=self.device,
         )
 
         self.step = 0

@@ -131,11 +131,14 @@ class AMP_PPO:
         # Set up the discriminator and move it to the appropriate device.
         self.discriminator: Discriminator = discriminator.to(self.device)
         self.amp_transition: RolloutStorage.Transition = RolloutStorage.Transition()
-        # Determine observation dimension used in the replay buffer.
-        # The discriminator expects concatenated observations, so the replay buffer uses half the dimension.
-        obs_dim: int = self.discriminator.input_dim // 2
+        # Determine observation dimension used in the replay buffer: the states are the first
+        # num_frames - 1 AMP frames of the discriminator window, the next states the last frame.
+        frame_dim: int = self.discriminator.frame_dim
         self.amp_storage: ReplayBuffer = ReplayBuffer(
-            obs_dim=obs_dim, buffer_size=amp_replay_buffer_size, device=device
+            obs_dim=frame_dim * (self.discriminator.num_frames - 1),
+            buffer_size=amp_replay_buffer_size,
+            device=device,
+            next_obs_dim=frame_dim,
         )
         self.amp_data: AMPLoader = amp_data
         self.storage: Optional[RolloutStorage] = (

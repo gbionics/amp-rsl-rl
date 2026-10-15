@@ -26,7 +26,7 @@ class Discriminator(nn.Module):
     It also provides reward signals for the policy through adversarial learning.
 
     Args:
-        input_dim (int): Dimension of the concatenated input state (state + next state).
+        input_dim (int): Dimension of the concatenated input (``num_frames`` AMP observations).
         hidden_layer_sizes (list): List of hidden layer sizes.
         reward_scale (float): Scale factor for the computed reward.
         reward_clamp_epsilon (float): Numerical epsilon used when clamping rewards.
@@ -35,6 +35,8 @@ class Discriminator(nn.Module):
         eta_wgan (float): Scaling factor for the Wasserstein loss (if used).
         use_minibatch_std (bool): Whether to use minibatch standard deviation in the network
         empirical_normalization (bool): Whether to normalize AMP observations empirically before scoring.
+        num_frames (int): Number of AMP observations in the input window. The default 2 is the
+            classic (state, next state) AMP discriminator.
     """
 
     def __init__(
@@ -49,11 +51,18 @@ class Discriminator(nn.Module):
         use_minibatch_std: bool = True,
         empirical_normalization: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        num_frames: int = 2,
     ):
         super().__init__()
 
+        if num_frames < 2 or input_dim % num_frames != 0:
+            raise ValueError(
+                f"input_dim ({input_dim}) must be num_frames ({num_frames} >= 2) AMP observations."
+            )
         self.device = torch.device(device)
         self.input_dim = input_dim
+        self.num_frames = num_frames
+        self.frame_dim = input_dim // num_frames
         self.reward_scale = reward_scale
         self.reward_clamp_epsilon = reward_clamp_epsilon
         layers = []
@@ -69,9 +78,8 @@ class Discriminator(nn.Module):
         self.linear = nn.Linear(final_in_dim, 1)
 
         self.empirical_normalization = empirical_normalization
-        amp_obs_dim = input_dim // 2
         if empirical_normalization:
-            self.amp_normalizer = EmpiricalNormalization(shape=[amp_obs_dim])
+            self.amp_normalizer = EmpiricalNormalization(shape=[self.frame_dim])
         else:
             self.amp_normalizer = nn.Identity()
 
@@ -117,9 +125,17 @@ class Discriminator(nn.Module):
                 "Symmetry configuration specifies use_data_augmentation=True but no amp_dataset_augmentation_func provided for the discriminator."
             )
 
-        augmented, _ = _call_augmentation_func(fn, obs=tensor, obs_type=obs_type)
+        augmented, _ = _call_augmentation_func(
+            fn, obs=tensor.reshape(-1, self.frame_dim), obs_type=obs_type
+        )
+        if augmented is None:
+            return tensor
+        # Mirror frame by frame: (copies * B * n, frame_dim) -> (copies * B, n * frame_dim).
+        return augmented.reshape(-1, tensor.shape[-1])
 
-        return augmented if augmented is not None else tensor
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize each AMP frame of ``x`` (..., n * frame_dim)."""
+        return self.amp_normalizer(x.reshape(-1, self.frame_dim)).reshape(x.shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the discriminator.
@@ -132,11 +148,7 @@ class Discriminator(nn.Module):
         """
 
         # Normalize AMP observations. If not enabled the normalizer is identity.
-        # split state and next_state and apply normalization
-        state, next_state = torch.split(x, self.input_dim // 2, dim=-1)
-        state = self.amp_normalizer(state)
-        next_state = self.amp_normalizer(next_state)
-        x = torch.cat([state, next_state], dim=-1)
+        x = self.normalize(x)
 
         h = self.trunk(x)
         if self.use_minibatch_std:
@@ -220,7 +232,7 @@ class Discriminator(nn.Module):
             return
         with torch.no_grad():
             for batch in batches:
-                self.amp_normalizer.update(batch)
+                self.amp_normalizer.update(batch.reshape(-1, self.frame_dim))
 
     def compute_loss(
         self,
@@ -232,8 +244,8 @@ class Discriminator(nn.Module):
     ):
 
         # Compute gradient penalty to stabilize discriminator training.
-        sample_amp_expert = tuple(self.amp_normalizer(s) for s in sample_amp_expert)
-        sample_amp_policy = tuple(self.amp_normalizer(s) for s in sample_amp_policy)
+        sample_amp_expert = tuple(self.normalize(s) for s in sample_amp_expert)
+        sample_amp_policy = tuple(self.normalize(s) for s in sample_amp_policy)
         grad_pen_loss = self.compute_grad_pen(
             expert_states=sample_amp_expert,
             policy_states=sample_amp_policy,
