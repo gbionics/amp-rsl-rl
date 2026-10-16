@@ -111,7 +111,9 @@ class AMPOnPolicyRunner:
     The class expects a `train_cfg` dictionary structured with keys:
     - "obs_groups": optional mapping describing which observation tensors belong to "policy" and "critic" inputs.
     - "policy": configuration for the policy network, including `"class_name"`
-    - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`
+    - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`. Set
+      `"use_mixed_precision": True` here to run the update forward/loss under
+      bfloat16 autocast on GPU (opt-in speed-up; default False keeps FP32 numerics).
     - "discriminator": configuration for the AMP discriminator
     - "dataset": dictionary forwarded to `AMPLoader`, containing at least:
         * "amp_data_path": folder with the `.npy` expert datasets
