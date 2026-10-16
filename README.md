@@ -96,6 +96,13 @@ for the policy update. AMP-specific components (the discriminator and expert/pol
 buffers) are augmented using the same configuration so that style rewards and adversarial
 training remain consistent with their symmetric counterparts.
 
+Recurrent (GRU/LSTM) policies are supported as well: during the rollout, the recurrent
+modules are additionally run on the mirrored observations so that the mirrored trajectories
+are evaluated with their own hidden states during the update. This costs one extra recurrent
+forward pass per environment step, and the augmentation function must mirror every
+observation group used by the actor and critic (it is called with
+`obs_type=["policy", "critic"]`).
+
 ---
 
 ### Example

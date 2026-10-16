@@ -335,6 +335,172 @@ class TestAMPPPOSymmetryMethods:
         assert out_actions.shape == (8, 3)
 
 
+# ── Tests for AMP_PPO recurrent symmetry helpers ────────────────────────────
+
+
+def _reference_hidden_state_selection(saved, dones, start, stop):
+    """Hidden-state selection of rsl_rl ``RolloutStorage.recurrent_mini_batch_generator``."""
+    dones = dones.squeeze(-1)
+    last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+    last_was_done[1:] = dones[:-1]
+    last_was_done[0] = True
+    last_was_done = last_was_done.permute(1, 0)
+    first_traj = torch.cat(
+        [torch.zeros(1, dtype=torch.long), last_was_done.sum(dim=1).cumsum(0)]
+    )
+    return (
+        saved.permute(2, 0, 1, 3)[last_was_done][first_traj[start] : first_traj[stop]]
+        .transpose(1, 0)
+        .contiguous()
+    )
+
+
+class TestAMPPPORecurrentSymmetry:
+    """Tests for the time-major (recurrent) symmetry helpers of AMP_PPO."""
+
+    def _make_stub(self, symmetry_cfg=None):
+        from amp_rsl_rl.algorithms.amp_ppo import AMP_PPO
+
+        class Stub:
+            pass
+
+        stub = Stub()
+        stub.symmetry_cfg = symmetry_cfg
+        stub._sym_num_aug = 1
+        stub._sym_saved_hidden_states = [None, None]
+        for name in (
+            "_apply_symmetry",
+            "_apply_symmetry_time_major",
+            "_augment_recurrent_inputs",
+            "_symmetric_hidden_state_generator",
+        ):
+            setattr(stub, name, getattr(AMP_PPO, name).__get__(stub))
+        stub._unflatten_time_major = AMP_PPO._unflatten_time_major
+        stub._cat_hidden_states = AMP_PPO._cat_hidden_states
+        return stub
+
+    @staticmethod
+    def _cfg():
+        return {
+            "use_data_augmentation": True,
+            "data_augmentation_func": _mirror_obs_and_actions,
+        }
+
+    @pytest.mark.parametrize("device", _devices)
+    def test_time_major_augmentation_stacks_along_batch(self, device):
+        stub = self._make_stub(self._cfg())
+        T, N = 5, 3
+        policy = torch.randn(T, N, 4, device=device)
+        critic = torch.randn(T, N, 6, device=device)
+        obs = TensorDict(
+            {"policy": policy, "critic": critic}, batch_size=[T, N], device=device
+        )
+        actions = torch.randn(T, N, 2, device=device)
+
+        aug_obs, aug_actions = stub._apply_symmetry_time_major(
+            obs=obs, actions=actions, obs_type=["policy", "critic"]
+        )
+
+        assert tuple(aug_obs.batch_size) == (T, 2 * N)
+        assert aug_actions.shape == (T, 2 * N, 2)
+        assert torch.equal(aug_obs["policy"][:, :N], policy)
+        assert torch.equal(aug_obs["policy"][:, N:], -policy)
+        assert torch.equal(aug_obs["critic"][:, N:], -critic)
+        assert torch.equal(aug_actions[:, :N], actions)
+        assert torch.equal(aug_actions[:, N:], -actions)
+
+    def test_time_major_incompatible_size_raises(self):
+        stub = self._make_stub()
+        with pytest.raises(ValueError, match="incompatible"):
+            stub._unflatten_time_major(torch.randn(7, 2), torch.randn(2, 3, 2))
+
+    def test_cat_hidden_states(self):
+        stub = self._make_stub()
+        h = torch.randn(1, 4, 8)
+        h_sym = torch.randn(1, 4, 8)
+        assert stub._cat_hidden_states(None, None) is None
+        out = stub._cat_hidden_states(h, h_sym)
+        assert out.shape == (1, 8, 8)
+        assert torch.equal(out[:, 4:], h_sym)
+        lstm = stub._cat_hidden_states((h, h), (h_sym, h_sym))
+        assert isinstance(lstm, tuple) and len(lstm) == 2
+        assert torch.equal(lstm[1][:, :4], h)
+        with pytest.raises(RuntimeError):
+            stub._cat_hidden_states(h, None)
+
+    @pytest.mark.parametrize("num_aug", [2, 3])
+    def test_symmetric_hidden_state_generator_matches_storage(self, num_aug):
+        torch.manual_seed(0)
+        T, N, L, H = 6, 4, 2, 5
+        num_mini_batches = 2
+        dones = (torch.rand(T, N, 1) < 0.3).to(torch.uint8)
+
+        class Storage:
+            pass
+
+        stub = self._make_stub(self._cfg())
+        stub.storage = Storage()
+        stub.storage.num_envs = N
+        stub.storage.dones = dones
+        stub._sym_num_aug = num_aug
+        saved_actor = torch.randn(T, L, (num_aug - 1) * N, H)
+        saved_critic = [torch.randn(T, L, (num_aug - 1) * N, H) for _ in range(2)]
+        stub._sym_saved_hidden_states = [[saved_actor], saved_critic]
+
+        batches = list(stub._symmetric_hidden_state_generator(num_mini_batches, 2))
+        assert len(batches) == 2 * num_mini_batches
+
+        mbs = N // num_mini_batches
+        for i, (h_actor, h_critic) in enumerate(batches[:num_mini_batches]):
+            start, stop = i * mbs, (i + 1) * mbs
+            expected_actor = torch.cat(
+                [
+                    _reference_hidden_state_selection(
+                        saved_actor[:, :, j * N : (j + 1) * N], dones, start, stop
+                    )
+                    for j in range(num_aug - 1)
+                ],
+                dim=1,
+            )
+            assert torch.equal(h_actor, expected_actor)
+            assert isinstance(h_critic, tuple) and len(h_critic) == 2
+            for component, saved in zip(h_critic, saved_critic):
+                expected = torch.cat(
+                    [
+                        _reference_hidden_state_selection(
+                            saved[:, :, j * N : (j + 1) * N], dones, start, stop
+                        )
+                        for j in range(num_aug - 1)
+                    ],
+                    dim=1,
+                )
+                assert torch.equal(component, expected)
+
+    def test_augment_recurrent_inputs(self):
+        stub = self._make_stub(self._cfg())
+        stub._sym_num_aug = 2
+        T, n_traj, L, H = 4, 5, 1, 3
+        obs = TensorDict(
+            {
+                "policy": torch.randn(T, n_traj, 2),
+                "critic": torch.randn(T, n_traj, 3),
+            },
+            batch_size=[T, n_traj],
+        )
+        masks = torch.rand(T, n_traj) > 0.5
+        h_a, h_a_sym = torch.randn(L, n_traj, H), torch.randn(L, n_traj, H)
+
+        aug_obs, aug_masks, (aug_h_a, aug_h_c), num_aug = (
+            stub._augment_recurrent_inputs(obs, masks, (h_a, None), (h_a_sym, None))
+        )
+
+        assert num_aug == 2
+        assert tuple(aug_obs.batch_size) == (T, 2 * n_traj)
+        assert torch.equal(aug_masks, torch.cat([masks, masks], dim=1))
+        assert torch.equal(aug_h_a, torch.cat([h_a, h_a_sym], dim=1))
+        assert aug_h_c is None
+
+
 # ── Integration: symmetry augmentation flow ──────────────────────────────────
 
 

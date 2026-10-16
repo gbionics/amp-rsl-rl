@@ -26,6 +26,11 @@ else:
     from rsl_rl.utils import string_to_callable as resolve_callable
 
 
+def _memory_hidden_state_attr(memory: nn.Module) -> str:
+    """Name of the hidden-state attribute of an rsl-rl v3 ``Memory`` (renamed across v3.x)."""
+    return "hidden_state" if hasattr(memory, "hidden_state") else "hidden_states"
+
+
 class AMP_PPO:
     """
     AMP_PPO implements Adversarial Motion Priors (AMP) combined with Proximal Policy Optimization (PPO).
@@ -213,11 +218,35 @@ class AMP_PPO:
                     "Symmetry configuration exists but the function is not callable: "
                     f"{aug_fn}"
                 )
-            if getattr(actor_critic, "is_recurrent", False):
-                raise ValueError(
-                    "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
-                )
             self.symmetry_cfg = symmetry_cfg
+
+        # Recurrent policies need the hidden states of the mirrored trajectories to evaluate
+        # the policy on them. They are tracked during the rollout by running the recurrent
+        # modules on the mirrored observations with a dedicated set of hidden states.
+        if RSL_RL_V4_PLUS:
+            self._is_recurrent: bool = bool(
+                self.actor.is_recurrent or self.critic.is_recurrent
+            )
+        else:
+            self._is_recurrent = bool(self.actor_critic.is_recurrent)
+        self._track_symmetric_hidden_states: bool = (
+            self._is_recurrent
+            and self.symmetry_cfg is not None
+            and self.symmetry_cfg.get("data_augmentation_func") is not None
+            and (
+                self.symmetry_cfg.get("use_data_augmentation", False)
+                or self.symmetry_cfg.get("use_mirror_loss", False)
+            )
+        )
+        # Number of symmetric copies (original included) returned by the augmentation function.
+        self._sym_num_aug: int = 1
+        # Running hidden states (actor, critic) of the mirrored copies, shaped
+        # [num_layers, (num_aug - 1) * num_envs, hidden_dim].
+        self._sym_hidden_states: Tuple[Any, Any] = (None, None)
+        # Per-step storage of the mirrored hidden states, (actor, critic), each a list with one
+        # [num_transitions_per_env, num_layers, (num_aug - 1) * num_envs, hidden_dim] tensor
+        # per recurrent state component (one for GRU, two for LSTM).
+        self._sym_saved_hidden_states: list = [None, None]
 
     def init_storage(
         self,
@@ -263,13 +292,14 @@ class AMP_PPO:
         return augmented.shape[0] // original_size
 
     def _repeat_along_batch(
-        self, tensor: Optional[torch.Tensor], num_aug: int
+        self, tensor: Optional[torch.Tensor], num_aug: int, dim: int = 0
     ) -> Optional[torch.Tensor]:
-        """Repeat a tensor along the first dimension to match augmentation factor."""
+        """Repeat a tensor along the batch dimension ``dim`` to match augmentation factor."""
 
         if tensor is None or num_aug == 1:
             return tensor
-        repeat_dims = [num_aug] + [1] * (tensor.dim() - 1)
+        repeat_dims = [1] * tensor.dim()
+        repeat_dims[dim] = num_aug
         return tensor.repeat(*repeat_dims)
 
     def _apply_symmetry(
@@ -296,6 +326,278 @@ class AMP_PPO:
             aug_obs if aug_obs is not None else obs,
             aug_actions if aug_actions is not None else actions,
         )
+
+    @staticmethod
+    def _unflatten_time_major(augmented: Any, reference: Any) -> Any:
+        """Reshape a flat ``[num_aug * T * N, ...]`` augmentation result to ``[T, num_aug * N, ...]``.
+
+        The augmentation function stacks the symmetric copies along the first dimension, i.e.
+        ``[original, mirror_1, ...]``. Each copy is reshaped back to ``[T, N, ...]`` and the
+        copies are concatenated along the batch (second) dimension.
+        """
+        if augmented is None or reference is None:
+            return augmented
+        num_steps, batch_size = reference.shape[0], reference.shape[1]
+        chunk = num_steps * batch_size
+        if augmented.shape[0] % chunk != 0:
+            raise ValueError(
+                "Symmetry augmentation function returned a batch size incompatible with the original size."
+                f" Original={chunk}, augmented={augmented.shape[0]}"
+            )
+        num_aug = augmented.shape[0] // chunk
+        return torch.cat(
+            [
+                augmented[i * chunk : (i + 1) * chunk].unflatten(
+                    0, (num_steps, batch_size)
+                )
+                for i in range(num_aug)
+            ],
+            dim=1,
+        )
+
+    def _apply_symmetry_time_major(
+        self,
+        *,
+        obs: Any = None,
+        actions: Optional[torch.Tensor] = None,
+        obs_type: Union[str, Sequence[str]] = None,
+    ) -> Tuple[Any, Optional[torch.Tensor]]:
+        """Apply symmetry augmentation to time-major ``[T, N, ...]`` data of recurrent batches.
+
+        The symmetric copies are concatenated along the batch (second) dimension so that the
+        time structure of the trajectories is preserved.
+        """
+        aug_obs, aug_actions = self._apply_symmetry(
+            obs=None if obs is None else obs.flatten(0, 1),
+            actions=None if actions is None else actions.flatten(0, 1),
+            obs_type=obs_type,
+        )
+        return (
+            self._unflatten_time_major(aug_obs, obs),
+            self._unflatten_time_major(aug_actions, actions),
+        )
+
+    @staticmethod
+    def _cat_hidden_states(hidden_state: Any, sym_hidden_state: Any) -> Any:
+        """Concatenate original and mirrored hidden states along the batch dimension."""
+        if hidden_state is None:
+            return None
+        if sym_hidden_state is None:
+            raise RuntimeError(
+                "Mirrored hidden states are missing for the recurrent symmetry augmentation."
+            )
+        if isinstance(hidden_state, (tuple, list)):  # LSTM
+            return tuple(
+                torch.cat([h, h_sym], dim=1)
+                for h, h_sym in zip(hidden_state, sym_hidden_state)
+            )
+        return torch.cat([hidden_state, sym_hidden_state], dim=1)
+
+    def _get_hidden_states(self) -> Tuple[Any, Any]:
+        """Return the current (actor, critic) rollout hidden states."""
+        if RSL_RL_V4_PLUS:
+            return self.actor.get_hidden_state(), self.critic.get_hidden_state()
+        return self.actor_critic.get_hidden_states()
+
+    def _set_hidden_states(self, hidden_states: Tuple[Any, Any]) -> None:
+        """Overwrite the current (actor, critic) rollout hidden states."""
+        hidden_state_actor, hidden_state_critic = hidden_states
+        if RSL_RL_V4_PLUS:
+            if self.actor.is_recurrent:
+                self.actor.reset(hidden_state=hidden_state_actor)
+            if self.critic.is_recurrent:
+                self.critic.reset(hidden_state=hidden_state_critic)
+        else:
+            for memory, hidden_state in (
+                (self.actor_critic.memory_a, hidden_state_actor),
+                (self.actor_critic.memory_c, hidden_state_critic),
+            ):
+                setattr(memory, _memory_hidden_state_attr(memory), hidden_state)
+
+    def _step_symmetric_hidden_states(self, obs: TensorDict) -> None:
+        """Store the mirrored hidden states of the current step and advance them.
+
+        The recurrent modules are run on the mirrored observations starting from the mirrored
+        hidden states. The hidden states of the original rollout are restored afterwards, so
+        the actions sampled by the policy are not affected.
+        """
+        # Record the mirrored hidden states *before* the forward pass (same convention as the
+        # hidden states of the original rollout stored in the rollout buffer).
+        step = self.storage.step
+        for role, hidden_state in enumerate(self._sym_hidden_states):
+            if hidden_state is None:
+                continue
+            components = (
+                hidden_state
+                if isinstance(hidden_state, (tuple, list))
+                else (hidden_state,)
+            )
+            if self._sym_saved_hidden_states[role] is None:
+                self._sym_saved_hidden_states[role] = [
+                    torch.zeros(
+                        self.storage.num_transitions_per_env,
+                        *component.shape,
+                        device=self.device,
+                    )
+                    for component in components
+                ]
+            for buffer, component in zip(
+                self._sym_saved_hidden_states[role], components
+            ):
+                buffer[step].copy_(component)
+
+        # Compute the mirrored observations (drop the original copy).
+        num_envs = obs.batch_size[0]
+        aug_obs, _ = self._apply_symmetry(
+            obs=obs, actions=None, obs_type=["policy", "critic"]
+        )
+        self._sym_num_aug = self._augment_batch_size(num_envs, aug_obs)
+        if self._sym_num_aug == 1:
+            return
+        mirrored_obs = aug_obs[num_envs:]
+
+        # Advance the mirrored hidden states and restore the original ones.
+        original_hidden_states = self._get_hidden_states()
+        self._set_hidden_states(self._sym_hidden_states)
+        if RSL_RL_V4_PLUS:
+            if self.actor.is_recurrent:
+                self.actor(mirrored_obs)
+            if self.critic.is_recurrent:
+                self.critic(mirrored_obs)
+        else:
+            self.actor_critic.act_inference(mirrored_obs)
+            self.actor_critic.evaluate(mirrored_obs)
+        self._sym_hidden_states = self._get_hidden_states()
+        self._set_hidden_states(original_hidden_states)
+
+    def _reset_symmetric_hidden_states(self, dones: torch.Tensor) -> None:
+        """Reset the mirrored hidden states of the terminated environments."""
+        if self._sym_num_aug == 1:
+            return
+        mask = (dones.view(-1) == 1).repeat(self._sym_num_aug - 1)
+        for hidden_state in self._sym_hidden_states:
+            if hidden_state is None:
+                continue
+            components = (
+                hidden_state
+                if isinstance(hidden_state, (tuple, list))
+                else (hidden_state,)
+            )
+            for component in components:
+                component[..., mask, :] = 0.0
+
+    def _symmetric_hidden_state_generator(self, num_mini_batches: int, num_epochs: int):
+        """Yield the mirrored (actor, critic) initial hidden states of each recurrent mini-batch.
+
+        Mirrors the trajectory selection of ``RolloutStorage.recurrent_mini_batch_generator``
+        so that the yielded hidden states are aligned with the trajectories of each mini-batch.
+        Each yielded hidden state has shape [num_layers, (num_aug - 1) * num_trajectories,
+        hidden_dim] with the mirrored copies stacked in the augmentation order.
+        """
+        num_envs = self.storage.num_envs
+        mini_batch_size = num_envs // num_mini_batches
+
+        dones = self.storage.dones.squeeze(-1)
+        last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+        last_was_done[1:] = dones[:-1]
+        last_was_done[0] = True
+        # [num_envs, time]
+        last_was_done = last_was_done.permute(1, 0)
+
+        def select(saved_hidden_states, start, stop):
+            if saved_hidden_states is None:
+                return None
+            components = []
+            for saved in saved_hidden_states:
+                # saved: [time, num_layers, (num_aug - 1) * num_envs, hidden_dim]
+                copies = []
+                for i in range(self._sym_num_aug - 1):
+                    offset = i * num_envs
+                    copies.append(
+                        saved[:, :, offset + start : offset + stop]
+                        .permute(2, 0, 1, 3)[last_was_done[start:stop]]
+                        .transpose(1, 0)
+                    )
+                components.append(torch.cat(copies, dim=1).contiguous())
+            return components[0] if len(components) == 1 else tuple(components)
+
+        for _ in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                yield (
+                    select(self._sym_saved_hidden_states[0], start, stop),
+                    select(self._sym_saved_hidden_states[1], start, stop),
+                )
+
+    def _augment_recurrent_inputs(
+        self,
+        obs_batch: TensorDict,
+        masks_batch: torch.Tensor,
+        hidden_states_batch: Tuple[Any, Any],
+        sym_hidden_states_batch: Tuple[Any, Any],
+    ) -> Tuple[TensorDict, torch.Tensor, Tuple[Any, Any], int]:
+        """Augment padded trajectories, masks and initial hidden states of a recurrent batch."""
+        aug_obs, _ = self._apply_symmetry_time_major(
+            obs=obs_batch, obs_type=["policy", "critic"]
+        )
+        num_aug = aug_obs.shape[1] // obs_batch.shape[1]
+        if num_aug == 1:
+            return obs_batch, masks_batch, hidden_states_batch, num_aug
+        if num_aug != self._sym_num_aug:
+            raise RuntimeError(
+                f"Symmetry augmentation produced {num_aug} copies during the update but "
+                f"{self._sym_num_aug} during the rollout."
+            )
+        aug_masks = masks_batch.repeat(1, num_aug)
+        aug_hidden_states = (
+            self._cat_hidden_states(hidden_states_batch[0], sym_hidden_states_batch[0]),
+            self._cat_hidden_states(hidden_states_batch[1], sym_hidden_states_batch[1]),
+        )
+        return aug_obs, aug_masks, aug_hidden_states, num_aug
+
+    def _recurrent_mirror_loss(
+        self,
+        obs_batch: TensorDict,
+        masks_batch: torch.Tensor,
+        hidden_states_batch: Tuple[Any, Any],
+        sym_hidden_states_batch: Tuple[Any, Any],
+        original_batch_size: int,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Compute the mirror loss of a recurrent (time-major) mini-batch.
+
+        The inputs are augmented here unless data augmentation already did it.
+        """
+        if not self.symmetry_cfg.get("use_data_augmentation", False):
+            obs_batch, masks_batch, hidden_states_batch, _ = (
+                self._augment_recurrent_inputs(
+                    obs_batch, masks_batch, hidden_states_batch, sym_hidden_states_batch
+                )
+            )
+        hidden_state_actor = hidden_states_batch[0]
+
+        if RSL_RL_V4_PLUS:
+            mean_actions_batch = self.actor(
+                obs_batch,
+                masks=masks_batch,
+                hidden_state=hidden_state_actor,
+                stochastic_output=False,
+            )
+        else:
+            self.actor_critic.act(obs_batch, masks_batch, hidden_state_actor)
+            mean_actions_batch = self.actor_critic.action_mean
+
+        if mean_actions_batch.shape[1] <= original_batch_size:
+            return torch.zeros(1, device=self.device), False
+
+        _, sym_actions = self._apply_symmetry_time_major(
+            actions=mean_actions_batch[:, :original_batch_size], obs_type="policy"
+        )
+        loss = torch.nn.functional.mse_loss(
+            mean_actions_batch[:, original_batch_size:],
+            sym_actions.detach()[:, original_batch_size:],
+        )
+        return loss, True
 
     def test_mode(self) -> None:
         """
@@ -330,9 +632,12 @@ class AMP_PPO:
         torch.Tensor
             Detached action tensor sampled from the actor-critic policy.
         """
+        if self._is_recurrent:
+            self.transition.hidden_states = self._get_hidden_states()
+        if self._track_symmetric_hidden_states:
+            self._step_symmetric_hidden_states(obs)
+
         if RSL_RL_V4_PLUS:
-            if self.actor.is_recurrent:
-                self.transition.hidden_states = self.actor.get_hidden_state()
             self.transition.actions = self.actor(obs, stochastic_output=True).detach()
             self.transition.values = self.critic(obs).detach()
             self.transition.actions_log_prob = self.actor.get_output_log_prob(
@@ -347,8 +652,6 @@ class AMP_PPO:
                 self.transition.action_mean = self.actor.output_mean.detach()
                 self.transition.action_sigma = self.actor.output_std.detach()
         else:
-            if self.actor_critic.is_recurrent:
-                self.transition.hidden_states = self.actor_critic.get_hidden_states()
             self.transition.actions = self.actor_critic.act(obs).detach()
             self.transition.values = self.actor_critic.evaluate(obs).detach()
             self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
@@ -416,6 +719,9 @@ class AMP_PPO:
             self.transition.clear()
             self.actor_critic.reset(dones)
 
+        if self._track_symmetric_hidden_states:
+            self._reset_symmetric_hidden_states(dones)
+
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
         """Insert a policy-generated AMP transition into the replay buffer.
 
@@ -438,7 +744,12 @@ class AMP_PPO:
         if RSL_RL_V4_PLUS:
             # v4+ removed compute_returns from RolloutStorage
             # (see https://github.com/leggedrobotics/rsl_rl/pull/137)
+            # Evaluating the last observation must not advance the recurrent rollout state.
+            if self.critic.is_recurrent:
+                hidden_state_critic = self.critic.get_hidden_state()
             last_values = self.critic(obs).detach()
+            if self.critic.is_recurrent:
+                self.critic.reset(hidden_state=hidden_state_critic)
             st = self.storage
             advantage = 0
             for step in reversed(range(st.num_transitions_per_env)):
@@ -462,7 +773,17 @@ class AMP_PPO:
                 st.advantages.std() + 1e-8
             )
         else:
+            # Evaluating the last observation must not advance the recurrent rollout state.
+            if self.actor_critic.is_recurrent:
+                memory_c = self.actor_critic.memory_c
+                hidden_state_critic = getattr(
+                    memory_c, _memory_hidden_state_attr(memory_c)
+                )
             last_values = self.actor_critic.evaluate(obs).detach()
+            if self.actor_critic.is_recurrent:
+                setattr(
+                    memory_c, _memory_hidden_state_attr(memory_c), hidden_state_critic
+                )
             self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(
@@ -496,11 +817,7 @@ class AMP_PPO:
         mean_symmetry_loss: float = 0.0
 
         # Create data generators for mini-batch sampling.
-        _is_recurrent = (
-            self.actor.is_recurrent
-            if RSL_RL_V4_PLUS
-            else self.actor_critic.is_recurrent
-        )
+        _is_recurrent = self._is_recurrent
 
         if _is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
@@ -510,6 +827,16 @@ class AMP_PPO:
             generator = self.storage.mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
+        # Initial hidden states of the mirrored trajectories (aligned with ``generator``).
+        sym_hidden_state_generator = (
+            self._symmetric_hidden_state_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
+            if self._track_symmetric_hidden_states
+            else None
+        )
+        # Recurrent batches are time-major: [time, batch, ...].
+        batch_dim = 1 if _is_recurrent else 0
 
         # Generator for policy-generated AMP transitions.
         amp_policy_generator = self.amp_storage.feed_forward_generator(
@@ -576,8 +903,13 @@ class AMP_PPO:
             hidden_state_actor, hidden_state_critic = (None, None)
             if hidden_states_batch is not None:
                 hidden_state_actor, hidden_state_critic = hidden_states_batch
+            sym_hidden_states_batch = (
+                next(sym_hidden_state_generator)
+                if sym_hidden_state_generator is not None
+                else (None, None)
+            )
 
-            original_batch_size = obs_batch.shape[0]
+            original_batch_size = actions_batch.shape[batch_dim]
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -589,23 +921,48 @@ class AMP_PPO:
             if self.symmetry_cfg and self.symmetry_cfg.get(
                 "use_data_augmentation", False
             ):
-                aug_obs, aug_actions = self._apply_symmetry(
-                    obs=obs_batch,
-                    actions=actions_batch,
-                    obs_type=["policy", "critic"],
-                )
-                num_aug = self._augment_batch_size(original_batch_size, aug_obs)
-                obs_batch = aug_obs
-                actions_batch = aug_actions
+                if _is_recurrent:
+                    (
+                        obs_batch,
+                        masks_batch,
+                        (hidden_state_actor, hidden_state_critic),
+                        num_aug,
+                    ) = self._augment_recurrent_inputs(
+                        obs_batch,
+                        masks_batch,
+                        (hidden_state_actor, hidden_state_critic),
+                        sym_hidden_states_batch,
+                    )
+                    _, actions_batch = self._apply_symmetry_time_major(
+                        actions=actions_batch, obs_type=["policy", "critic"]
+                    )
+                    if actions_batch.shape[1] != num_aug * original_batch_size:
+                        raise ValueError(
+                            "Symmetry augmentation function returned a different number of"
+                            " copies for observations and actions."
+                        )
+                else:
+                    aug_obs, aug_actions = self._apply_symmetry(
+                        obs=obs_batch,
+                        actions=actions_batch,
+                        obs_type=["policy", "critic"],
+                    )
+                    num_aug = self._augment_batch_size(original_batch_size, aug_obs)
+                    obs_batch = aug_obs
+                    actions_batch = aug_actions
 
                 old_actions_log_prob_batch = self._repeat_along_batch(
-                    old_actions_log_prob_batch, num_aug
+                    old_actions_log_prob_batch, num_aug, batch_dim
                 )
                 target_values_batch = self._repeat_along_batch(
-                    target_values_batch, num_aug
+                    target_values_batch, num_aug, batch_dim
                 )
-                advantages_batch = self._repeat_along_batch(advantages_batch, num_aug)
-                returns_batch = self._repeat_along_batch(returns_batch, num_aug)
+                advantages_batch = self._repeat_along_batch(
+                    advantages_batch, num_aug, batch_dim
+                )
+                returns_batch = self._repeat_along_batch(
+                    returns_batch, num_aug, batch_dim
+                )
 
             # Forward pass through the actor to get current policy outputs.
             if RSL_RL_V4_PLUS:
@@ -621,27 +978,47 @@ class AMP_PPO:
                 )
                 if hasattr(self.actor, "get_distribution_params"):
                     dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0][:original_batch_size]
-                    sigma_batch = dist_params[1][:original_batch_size]
-                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
+                    mu_batch = dist_params[0].narrow(batch_dim, 0, original_batch_size)
+                    sigma_batch = dist_params[1].narrow(
+                        batch_dim, 0, original_batch_size
+                    )
+                    entropy_batch = self.actor.get_entropy().narrow(
+                        batch_dim, 0, original_batch_size
+                    )
                 else:
-                    mu_batch = self.actor.output_mean[:original_batch_size]
-                    sigma_batch = self.actor.output_std[:original_batch_size]
-                    entropy_batch = self.actor.output_entropy[:original_batch_size]
+                    mu_batch = self.actor.output_mean.narrow(
+                        batch_dim, 0, original_batch_size
+                    )
+                    sigma_batch = self.actor.output_std.narrow(
+                        batch_dim, 0, original_batch_size
+                    )
+                    entropy_batch = self.actor.output_entropy.narrow(
+                        batch_dim, 0, original_batch_size
+                    )
             else:
-                # v3
-                self.actor_critic.act(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
+                # v3 (positional recurrent args: the keyword was renamed across v3.x)
+                recurrent_args_actor = (
+                    (masks_batch, hidden_state_actor) if _is_recurrent else ()
                 )
+                recurrent_args_critic = (
+                    (masks_batch, hidden_state_critic) if _is_recurrent else ()
+                )
+                self.actor_critic.act(obs_batch, *recurrent_args_actor)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
                     actions_batch
                 )
                 value_batch = self.actor_critic.evaluate(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
+                    obs_batch, *recurrent_args_critic
                 )
-                mu_batch = self.actor_critic.action_mean[:original_batch_size]
-                sigma_batch = self.actor_critic.action_std[:original_batch_size]
-                entropy_batch = self.actor_critic.entropy[:original_batch_size]
+                mu_batch = self.actor_critic.action_mean.narrow(
+                    batch_dim, 0, original_batch_size
+                )
+                sigma_batch = self.actor_critic.action_std.narrow(
+                    batch_dim, 0, original_batch_size
+                )
+                entropy_batch = self.actor_critic.entropy.narrow(
+                    batch_dim, 0, original_batch_size
+                )
 
             # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -712,7 +1089,21 @@ class AMP_PPO:
             # mini-batch, inflating Perf/learning_time even when symmetry is off).
             symmetry_loss_value = torch.zeros(1, device=self.device)
             if self.symmetry_cfg and self.symmetry_cfg.get("use_mirror_loss", False):
-                if not self.symmetry_cfg.get("use_data_augmentation", False):
+                sym_obs_batch = None
+                if _is_recurrent:
+                    symmetry_loss_value, has_symmetry_loss = (
+                        self._recurrent_mirror_loss(
+                            obs_batch,
+                            masks_batch,
+                            (hidden_state_actor, hidden_state_critic),
+                            sym_hidden_states_batch,
+                            original_batch_size,
+                        )
+                    )
+                    if has_symmetry_loss:
+                        coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
+                        ppo_loss = ppo_loss + coeff * symmetry_loss_value
+                elif not self.symmetry_cfg.get("use_data_augmentation", False):
                     sym_obs_batch, _ = self._apply_symmetry(
                         obs=obs_batch[:original_batch_size],
                         actions=None,
