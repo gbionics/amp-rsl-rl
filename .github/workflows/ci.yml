@@ -12,8 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rsl-rl-version: ["3.1.3", "3.3.0", "4.0.1", "5.2.0"]
-        python-version: ["3.10"]
+        rsl-rl-version: ["5.5.1"]
+        python-version: ["3.12"]
 
     name: rsl-rl-lib ${{ matrix.rsl-rl-version }}
     steps:

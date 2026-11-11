@@ -13,6 +13,7 @@ from .motion_loader import (
     VelocityRepresentation
 )
 from .exporter import export_policy_as_onnx
+from .code_state import store_code_state
 
 __all__ = [
     "AMPLoader",
@@ -20,4 +21,5 @@ __all__ = [
     "download_amp_dataset_from_hf",
     "_call_augmentation_func",
     "export_policy_as_onnx",
+    "store_code_state",
 ]

@@ -19,21 +19,20 @@ maintainers = [  # Added separate maintainers section
 ]
 license = "BSD-3-Clause"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 classifiers = [  # Added standard PyPI classifiers
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 keywords = ["reinforcement-learning", "robotics", "motion-priors", "ppo"]
 dependencies = [
     "numpy>=1.21.0",
     "scipy>=1.7.0",
-    "rsl-rl-lib>=3.0.0",
-    "torch>=2.6.0",
+    "rsl-rl-lib>=5.5.1,<6",
+    "torch>=2.7.0",
     "tensordict>=0.7.0",
 ]
 dynamic = ["version"]

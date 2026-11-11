@@ -8,12 +8,8 @@ import inspect
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Dict, Optional, Any, Sequence
 from dataclasses import dataclass
-from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS
 
-if RSL_RL_V3_3_PLUS:
-    from rsl_rl.utils import resolve_callable
-else:
-    from rsl_rl.utils import string_to_callable as resolve_callable
+from rsl_rl.utils import resolve_callable
 
 import torch
 import numpy as np
@@ -123,11 +119,11 @@ class MotionData:
         - base_ang_velocities_mixed: (currently zeros)
         - base_lin_velocities_local: linear velocity in local (body) frame
         - base_ang_velocities_local: (currently zeros)
-        - base_quat: orientation quaternion as torch.Tensor in wxyz order
+        - base_quat: orientation quaternion as torch.Tensor in xyzw order
 
     Notes:
         - The quaternion is expected in the dataset as `xyzw` format (SciPy default),
-          and it is converted internally to `wxyz` format to be compatible with IsaacLab conventions.
+          which is also the Isaac Lab 3 convention, so it is kept as is.
         - All data is converted to torch.Tensor on the specified device during initialization.
     """
 
@@ -158,10 +154,8 @@ class MotionData:
         if isinstance(self.base_ang_velocities_local, np.ndarray):
             self.base_ang_velocities_local = to_tensor(self.base_ang_velocities_local)
         if isinstance(self.base_quat, Rotation):
-            quat_xyzw = self.base_quat.as_quat()  # (T,4) xyzw
-            # convert to wxyz
             self.base_quat = torch.tensor(
-                quat_xyzw[:, [3, 0, 1, 2]],
+                self.base_quat.as_quat(),  # (T,4) xyzw
                 device=self.device,
                 dtype=torch.float32,
             )
@@ -303,7 +297,8 @@ class AMPLoader:
         if symmetry_cfg is not None:
             aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if isinstance(aug_fn, str):
-                symmetry_cfg["amp_dataset_augmentation_func"] = resolve_callable(aug_fn)
+                # str() unwraps callable string wrappers (e.g. Isaac Lab ResolvableString) to the real function.
+                symmetry_cfg["amp_dataset_augmentation_func"] = resolve_callable(str(aug_fn))
             aug_fn = symmetry_cfg.get("amp_dataset_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
                 raise ValueError(

@@ -42,9 +42,15 @@ The required dependencies include:
 - `numpy`
 - `scipy`
 - `torch`
-- `rsl-rl-lib`
+- `rsl-rl-lib` (>= 5.5.1, the version used by Isaac Lab 3)
 
-These will be automatically installed via pip.
+These will be automatically installed via pip. Python >= 3.12 is required.
+
+The runner follows the rsl-rl 5 configuration layout: separate `actor` and `critic` model
+configs (`class_name` can be any `rsl_rl.models` model, e.g. `MLPModel`, or
+`amp_rsl_rl.networks:MoEModel` for a Mixture-of-Experts actor), observation groups
+`actor`/`critic`/`amp`, and quaternions in `xyzw` order (Isaac Lab 3 convention).
+Older rsl-rl releases (`ActorCritic`, `policy` config) are no longer supported.
 
 ---
 
