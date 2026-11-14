@@ -73,6 +73,14 @@ class AMP_PPO:
         Whether to normalize advantages within each mini-batch (instead of the entire rollout).
     symmetry_cfg : dict | None, default=None
         Configuration dict enabling symmetry-based data augmentation and mirror loss.
+    bound_loss_coef : float, default=0.0
+        Coefficient of the action bound loss ``sum_j relu(|mu_j| - bound_j)^2`` on the policy mean
+        (as in IsaacGymEnvs AMP / rl_games). With clipped or saturating actions the mean can
+        otherwise drift beyond the bounds, where the sampled noise has no effect and the entropy
+        bonus grows the std without limit. Disabled when 0.
+    action_bounds : float | Sequence[float] | None, default=None
+        Bound of the policy mean, scalar or one value per action dimension. Required when
+        ``bound_loss_coef > 0``.
     device : str, default="cpu"
         Torch device used by the module.
     """
@@ -99,6 +107,8 @@ class AMP_PPO:
         use_smooth_ratio_clipping: bool = False,
         normalize_advantage_per_mini_batch: bool = False,
         symmetry_cfg: Optional[Dict[str, Any]] = None,
+        bound_loss_coef: float = 0.0,
+        action_bounds: Optional[Union[float, Sequence[float]]] = None,
         device: str = "cpu",
     ) -> None:
         self.device: str = device
@@ -144,6 +154,17 @@ class AMP_PPO:
         self.max_grad_norm: float = max_grad_norm
         self.use_clipped_value_loss: bool = use_clipped_value_loss
         self.use_smooth_ratio_clipping: bool = use_smooth_ratio_clipping
+
+        # Action bound loss on the policy mean
+        self.bound_loss_coef: float = bound_loss_coef
+        self.action_bounds: Optional[torch.Tensor] = None
+        if bound_loss_coef > 0.0:
+            if action_bounds is None:
+                raise ValueError("bound_loss_coef > 0 requires action_bounds.")
+            self.action_bounds = torch.as_tensor(action_bounds, dtype=torch.float, device=self.device)
+            if torch.any(self.action_bounds <= 0.0):
+                raise ValueError(f"action_bounds must be positive, got {action_bounds}.")
+        self.mean_bound_loss: float = 0.0
 
         # Symmetry configuration for PPO and AMP augmentation
         self.symmetry_cfg: Optional[Dict[str, Any]] = None
@@ -314,6 +335,7 @@ class AMP_PPO:
         mean_accuracy_expert_elem: float = 0.0
         mean_kl_divergence: float = 0.0
         mean_symmetry_loss: float = 0.0
+        mean_bound_loss: float = 0.0
 
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -405,6 +427,13 @@ class AMP_PPO:
 
             ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Action bound loss, on the means of this mini-batch (before the mirror loss reruns the actor).
+            bound_loss = torch.zeros((), device=self.device)
+            if self.bound_loss_coef > 0.0:
+                excess = (self.actor.output_mean.abs() - self.action_bounds).clamp(min=0.0)
+                bound_loss = excess.square().sum(dim=-1).mean()
+                ppo_loss = ppo_loss + self.bound_loss_coef * bound_loss
+
             # Mirror loss, only computed when it feeds the gradient (it costs an extra actor pass).
             symmetry_loss_value = torch.zeros(1, device=self.device)
             if self.symmetry_cfg and self.symmetry_cfg.get("use_mirror_loss", False):
@@ -494,6 +523,7 @@ class AMP_PPO:
             mean_policy_pred += policy_d_prob.mean().item()
             mean_expert_pred += expert_d_prob.mean().item()
             mean_symmetry_loss += symmetry_loss_value.item()
+            mean_bound_loss += bound_loss.item()
 
             mean_accuracy_policy += torch.sum(torch.round(policy_d_prob) == torch.zeros_like(policy_d_prob)).item()
             mean_accuracy_expert += torch.sum(torch.round(expert_d_prob) == torch.ones_like(expert_d_prob)).item()
@@ -511,6 +541,8 @@ class AMP_PPO:
         mean_accuracy_expert /= max(1, mean_accuracy_expert_elem)
         mean_kl_divergence /= num_updates
         mean_symmetry_loss /= num_updates
+        # Not in the returned tuple (kept for compatibility): read by the runner log.
+        self.mean_bound_loss = mean_bound_loss / num_updates
 
         self.storage.clear()
 

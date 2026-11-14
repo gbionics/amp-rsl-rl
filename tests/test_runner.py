@@ -139,3 +139,19 @@ def test_learn_save_load(dataset_dir, actor_class):
         other = AMPOnPolicyRunner(env, copy.deepcopy(cfg), log_dir=None)
         other.load(str(checkpoint))
         torch.testing.assert_close(other.get_inference_policy()(obs), policy(obs))
+
+
+def test_bound_loss_pulls_mean_inside_bounds(dataset_dir):
+    env = FakeEnv(_amp_dim(dataset_dir))
+    cfg = _train_cfg(dataset_dir)
+    cfg["algorithm"].update(bound_loss_coef=10.0, action_bounds=[0.5] * NUM_JOINTS)
+    with tempfile.TemporaryDirectory() as log_dir:
+        runner = AMPOnPolicyRunner(env, cfg, log_dir=log_dir)
+        with torch.no_grad():
+            runner.alg.actor.mlp[-1].bias.fill_(5.0)
+        obs = env.get_observations()
+        before = runner.get_inference_policy()(obs).abs().mean()
+        runner.learn(num_learning_iterations=3)
+        after = runner.get_inference_policy()(obs).abs().mean()
+    assert runner.alg.mean_bound_loss > 0.0
+    assert after < before

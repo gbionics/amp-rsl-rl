@@ -575,6 +575,8 @@ class AMPOnPolicyRunner:
             "Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"]
         )
         self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
+        if getattr(self.alg, "bound_loss_coef", 0.0) > 0.0:
+            self.writer.add_scalar("Loss/bound", self.alg.mean_bound_loss, locs["it"])
         self.writer.add_scalar(
             "Policy/mean_noise_std", mean_std_value.item(), locs["it"]
         )

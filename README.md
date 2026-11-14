@@ -104,6 +104,16 @@ training remain consistent with their symmetric counterparts.
 
 ---
 
+## Action bound loss
+With clipped or saturating actions (e.g. `clip_actions`, or an action term that clamps to the
+joint limits) the Gaussian mean can drift beyond the bounds: there the sampled noise has no effect
+and the entropy bonus grows the policy std without limit. Setting `bound_loss_coef > 0` and
+`action_bounds` (scalar or one value per action) in the algorithm configuration adds
+`bound_loss_coef * sum_j relu(|mu_j| - action_bounds_j)^2` to the PPO loss (as in IsaacGymEnvs
+AMP / rl_games), logged as `Loss/bound`.
+
+---
+
 ### Example
 
 Here’s an example of how the structure might look when loaded in Python:
