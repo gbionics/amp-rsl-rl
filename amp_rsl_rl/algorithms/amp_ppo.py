@@ -6,33 +6,30 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Dict, Any, Union, Sequence
+from itertools import chain
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
+from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import resolve_callable
 
-from amp_rsl_rl.storage import ReplayBuffer, build_rollout_storage
 from amp_rsl_rl.networks import Discriminator
+from amp_rsl_rl.storage import ReplayBuffer
 from amp_rsl_rl.utils import AMPLoader, _call_augmentation_func
-from amp_rsl_rl.utils._compat import RSL_RL_V3_3_PLUS, RSL_RL_V4_PLUS, RSL_RL_V5_PLUS
-
-if RSL_RL_V3_3_PLUS:
-    from rsl_rl.utils import resolve_callable
-else:
-    from rsl_rl.utils import string_to_callable as resolve_callable
 
 
 class AMP_PPO:
     """
     AMP_PPO implements Adversarial Motion Priors (AMP) combined with Proximal Policy Optimization (PPO).
 
-    The algorithm mirrors the structure of upstream ``PPO`` from ``rsl_rl`` but augments each update
-    with a discriminator trained on expert trajectories. Observations feed into the policy as
-    TensorDicts, allowing the actor and critic to consume different observation groups.
+    The algorithm mirrors the structure of upstream ``PPO`` from ``rsl_rl`` (>= 5.5) but augments
+    each update with a discriminator trained on expert trajectories. Observations feed into the
+    actor and critic models as TensorDicts, allowing them to consume different observation groups.
 
     Parameters
     ----------
@@ -40,6 +37,10 @@ class AMP_PPO:
         AMP discriminator distinguishing expert vs policy motion pairs.
     amp_data : AMPLoader
         Data loader that provides batches of expert motion data.
+    actor : MLPModel
+        Stochastic actor model (any ``rsl_rl.models`` model with an output distribution).
+    critic : MLPModel
+        Critic model.
     num_learning_epochs : int, default=1
         Number of passes over the rollout buffer per update.
     num_mini_batches : int, default=1
@@ -80,9 +81,8 @@ class AMP_PPO:
         self,
         discriminator: Discriminator,
         amp_data: AMPLoader,
-        actor_critic=None,
-        actor=None,
-        critic=None,
+        actor: MLPModel,
+        critic: MLPModel,
         num_learning_epochs: int = 1,
         num_mini_batches: int = 1,
         clip_param: float = 0.2,
@@ -101,38 +101,19 @@ class AMP_PPO:
         symmetry_cfg: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
     ) -> None:
-        # Set device and learning hyperparameters
         self.device: str = device
         self.desired_kl: float = desired_kl
         self.schedule: str = schedule
         self.learning_rate: float = learning_rate
-        self.normalize_advantage_per_mini_batch: bool = (
-            normalize_advantage_per_mini_batch
-        )
+        self.normalize_advantage_per_mini_batch: bool = normalize_advantage_per_mini_batch
 
-        if RSL_RL_V4_PLUS:
-            if actor is None or critic is None:
-                raise ValueError(
-                    "rsl-rl-lib >= 4 detected: 'actor' and 'critic' must both be provided to AMP_PPO."
-                )
-            self.actor = actor.to(self.device)
-            self.critic = critic.to(self.device)
-            self.actor_critic = None
-        else:
-            if actor_critic is None:
-                raise ValueError(
-                    "rsl-rl-lib < 4 detected: 'actor_critic' must be provided to AMP_PPO."
-                )
-            # Set up the actor-critic (policy) and move it to the device.
-            self.actor_critic = actor_critic.to(self.device)
-            self.actor = self.actor_critic
-            self.critic = None
+        self.actor = actor.to(self.device)
+        self.critic = critic.to(self.device)
 
-        # Set up the discriminator and move it to the appropriate device.
         self.discriminator: Discriminator = discriminator.to(self.device)
         self.amp_transition: RolloutStorage.Transition = RolloutStorage.Transition()
-        # Determine observation dimension used in the replay buffer: the states are the first
-        # num_frames - 1 AMP frames of the discriminator window, the next states the last frame.
+        # The replay buffer states are the first num_frames - 1 AMP frames of the discriminator
+        # window, the next states its last frame.
         frame_dim: int = self.discriminator.frame_dim
         self.amp_storage: ReplayBuffer = ReplayBuffer(
             obs_dim=frame_dim * (self.discriminator.num_frames - 1),
@@ -141,41 +122,14 @@ class AMP_PPO:
             next_obs_dim=frame_dim,
         )
         self.amp_data: AMPLoader = amp_data
-        self.storage: Optional[RolloutStorage] = (
-            None  # Will be initialized later once environment parameters are known
-        )
+        self.storage: Optional[RolloutStorage] = None  # set by init_storage
 
-        # Create optimizer for both the actor-critic and the discriminator.
-        # Note: Weight decay is set differently for discriminator trunk and head.
-        if RSL_RL_V4_PLUS:
-            params = [
-                {"params": self.actor.parameters(), "name": "actor"},
-                {"params": self.critic.parameters(), "name": "critic"},
-                {
-                    "params": self.discriminator.trunk.parameters(),
-                    "weight_decay": 10e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": self.discriminator.linear.parameters(),
-                    "weight_decay": 10e-2,
-                    "name": "amp_head",
-                },
-            ]
-        else:
-            params = [
-                {"params": self.actor_critic.parameters(), "name": "actor_critic"},
-                {
-                    "params": self.discriminator.trunk.parameters(),
-                    "weight_decay": 10e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": self.discriminator.linear.parameters(),
-                    "weight_decay": 10e-2,
-                    "name": "amp_head",
-                },
-            ]
+        # Weight decay differs between the discriminator trunk and head.
+        params = [
+            {"params": list(chain(self.actor.parameters(), self.critic.parameters())), "name": "actor_critic"},
+            {"params": self.discriminator.trunk.parameters(), "weight_decay": 10e-4, "name": "amp_trunk"},
+            {"params": self.discriminator.linear.parameters(), "weight_decay": 10e-2, "name": "amp_head"},
+        ]
         self.optimizer: optim.Adam = optim.Adam(params, lr=learning_rate)
         self.transition: RolloutStorage.Transition = RolloutStorage.Transition()
 
@@ -194,29 +148,19 @@ class AMP_PPO:
         # Symmetry configuration for PPO and AMP augmentation
         self.symmetry_cfg: Optional[Dict[str, Any]] = None
         if symmetry_cfg is not None:
-            use_data_augmentation = symmetry_cfg.get("use_data_augmentation", False)
-            use_mirror_loss = symmetry_cfg.get("use_mirror_loss", False)
-            if not use_data_augmentation:
-                print(
-                    "Data augmentation is not enabled. Symmetry utilities will only be available for logging."
-                )
-            if not use_mirror_loss:
-                print(
-                    "Mirror loss is not enabled. Symmetry utilities will only be available for logging."
-                )
+            if not symmetry_cfg.get("use_data_augmentation", False):
+                print("Data augmentation is not enabled. Symmetry utilities will only be available for logging.")
+            if not symmetry_cfg.get("use_mirror_loss", False):
+                print("Mirror loss is not enabled. Symmetry utilities will only be available for logging.")
             aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if isinstance(aug_fn, str):
-                symmetry_cfg["data_augmentation_func"] = resolve_callable(aug_fn)
+                # str() unwraps callable string wrappers (e.g. Isaac Lab ResolvableString) to the real function.
+                symmetry_cfg["data_augmentation_func"] = resolve_callable(str(aug_fn))
             aug_fn = symmetry_cfg.get("data_augmentation_func", None)
             if aug_fn is not None and not callable(aug_fn):
-                raise ValueError(
-                    "Symmetry configuration exists but the function is not callable: "
-                    f"{aug_fn}"
-                )
-            if getattr(actor_critic, "is_recurrent", False):
-                raise ValueError(
-                    "Symmetry augmentation is not supported for recurrent policies in AMP_PPO."
-                )
+                raise ValueError(f"Symmetry configuration exists but the function is not callable: {aug_fn}")
+            if self.actor.is_recurrent or self.critic.is_recurrent:
+                raise ValueError("Symmetry augmentation is not supported for recurrent policies in AMP_PPO.")
             self.symmetry_cfg = symmetry_cfg
 
     def init_storage(
@@ -226,33 +170,13 @@ class AMP_PPO:
         observations: TensorDict,
         action_shape: Tuple[int, ...],
     ) -> None:
-        """Initialize rollout storage for TensorDict observations.
-
-        Parameters
-        ----------
-        num_envs : int
-            Number of parallel environments.
-        num_transitions_per_env : int
-            Horizon (per environment) stored inside the rollout buffer.
-        observations : TensorDict
-            Prototype observation structure used to determine buffer shapes.
-        action_shape : Tuple[int, ...]
-            Shape of the action vector output by the policy.
-        """
-        self.storage = build_rollout_storage(
-            training_type="rl",
-            num_envs=num_envs,
-            num_transitions_per_env=num_transitions_per_env,
-            obs=observations,
-            actions_shape=action_shape,
-            device=self.device,
+        """Initialize rollout storage for TensorDict observations (dtypes are preserved)."""
+        self.storage = RolloutStorage(
+            "rl", num_envs, num_transitions_per_env, observations, action_shape, device=self.device
         )
 
-    def _augment_batch_size(
-        self, original_size: int, augmented: Optional[torch.Tensor]
-    ) -> int:
+    def _augment_batch_size(self, original_size: int, augmented: Optional[torch.Tensor]) -> int:
         """Compute augmentation factor given the original and augmented batch sizes."""
-
         if augmented is None or original_size == 0:
             return 1
         if augmented.shape[0] % original_size != 0:
@@ -262,15 +186,11 @@ class AMP_PPO:
             )
         return augmented.shape[0] // original_size
 
-    def _repeat_along_batch(
-        self, tensor: Optional[torch.Tensor], num_aug: int
-    ) -> Optional[torch.Tensor]:
+    def _repeat_along_batch(self, tensor: Optional[torch.Tensor], num_aug: int) -> Optional[torch.Tensor]:
         """Repeat a tensor along the first dimension to match augmentation factor."""
-
         if tensor is None or num_aug == 1:
             return tensor
-        repeat_dims = [num_aug] + [1] * (tensor.dim() - 1)
-        return tensor.repeat(*repeat_dims)
+        return tensor.repeat(*([num_aug] + [1] * (tensor.dim() - 1)))
 
     def _apply_symmetry(
         self,
@@ -280,94 +200,45 @@ class AMP_PPO:
         obs_type: Union[str, Sequence[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Apply configured symmetry augmentation to observations/actions."""
-
         if self.symmetry_cfg is None:
             return obs, actions
-
         aug_fn = self.symmetry_cfg.get("data_augmentation_func", None)
         if aug_fn is None:
             return obs, actions
-
-        aug_obs, aug_actions = _call_augmentation_func(
-            aug_fn, obs=obs, actions=actions, obs_type=obs_type
-        )
-
+        aug_obs, aug_actions = _call_augmentation_func(aug_fn, obs=obs, actions=actions, obs_type=obs_type)
         return (
             aug_obs if aug_obs is not None else obs,
             aug_actions if aug_actions is not None else actions,
         )
 
+    def get_policy(self) -> MLPModel:
+        """Return the actor model (rsl-rl 5 algorithm interface)."""
+        return self.actor
+
     def test_mode(self) -> None:
-        """
-        Sets the actor-critic model to evaluation mode.
-        """
-        if RSL_RL_V4_PLUS:
-            self.actor.eval()
-            self.critic.eval()
-        else:
-            self.actor_critic.eval()
+        """Sets the actor and critic to evaluation mode."""
+        self.actor.eval()
+        self.critic.eval()
+
+    eval_mode = test_mode
 
     def train_mode(self) -> None:
-        """
-        Sets the actor-critic model to training mode.
-        """
-        if RSL_RL_V4_PLUS:
-            self.actor.train()
-            self.critic.train()
-        else:
-            self.actor_critic.train()
+        """Sets the actor and critic to training mode."""
+        self.actor.train()
+        self.critic.train()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Select an action and value estimate for the current observation.
-
-        Parameters
-        ----------
-        obs : TensorDict
-            Batched observation TensorDict provided by the environment.
-
-        Returns
-        -------
-        torch.Tensor
-            Detached action tensor sampled from the actor-critic policy.
-        """
-        if RSL_RL_V4_PLUS:
-            if self.actor.is_recurrent:
-                self.transition.hidden_states = self.actor.get_hidden_state()
-            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-            self.transition.values = self.critic(obs).detach()
-            self.transition.actions_log_prob = self.actor.get_output_log_prob(
-                self.transition.actions
-            ).detach()
-            if RSL_RL_V5_PLUS:
-                self.transition.distribution_params = [
-                    self.actor.output_mean.detach(),
-                    self.actor.output_std.detach(),
-                ]
-            else:
-                self.transition.action_mean = self.actor.output_mean.detach()
-                self.transition.action_sigma = self.actor.output_std.detach()
-        else:
-            if self.actor_critic.is_recurrent:
-                self.transition.hidden_states = self.actor_critic.get_hidden_states()
-            self.transition.actions = self.actor_critic.act(obs).detach()
-            self.transition.values = self.actor_critic.evaluate(obs).detach()
-            self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
-                self.transition.actions
-            ).detach()
-            self.transition.action_mean = self.actor_critic.action_mean.detach()
-            self.transition.action_sigma = self.actor_critic.action_std.detach()
-
+        """Sample an action and a value estimate for the current observation."""
+        self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+        self.transition.values = self.critic(obs).detach()
+        self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()
+        self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         self.transition.observations = obs
         return self.transition.actions
 
     def act_amp(self, amp_obs: torch.Tensor) -> None:
-        """Store the latest AMP policy observation for later replay insertion.
-
-        Parameters
-        ----------
-        amp_obs : torch.Tensor
-            Concatenated AMP observation representing the current policy state.
-        """
+        """Store the latest AMP policy observation for later replay insertion."""
         self.amp_transition.observations = amp_obs
 
     def process_env_step(
@@ -377,111 +248,60 @@ class AMP_PPO:
         dones: torch.Tensor,
         extras: Dict[str, Any],
     ) -> None:
-        """Record the outcome of an environment step and update normalizers.
-
-        Parameters
-        ----------
-        obs : TensorDict
-            Observation returned by the environment after stepping.
-        rewards : torch.Tensor
-            Reward tensor (batch x 1) after mixing task/style components.
-        dones : torch.Tensor
-            Episode termination flags.
-        extras : dict[str, Any]
-            Additional metadata from the environment (e.g. ``time_outs``).
-        """
-        if RSL_RL_V4_PLUS:
-            self.actor.update_normalization(obs)
-            self.critic.update_normalization(obs)
-        else:
-            self.actor_critic.update_normalization(obs)
+        """Record the outcome of an environment step and update normalizers."""
+        self.actor.update_normalization(obs)
+        self.critic.update_normalization(obs)
 
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values
-                * extras["time_outs"].unsqueeze(1).to(self.device),
+                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),
                 1,
             )
 
-        if RSL_RL_V4_PLUS:
-            self.storage.add_transition(self.transition)
-            self.transition.clear()
-            self.actor.reset(dones)
-            self.critic.reset(dones)
-        else:
-            self.storage.add_transitions(self.transition)
-            self.transition.clear()
-            self.actor_critic.reset(dones)
+        self.storage.add_transition(self.transition)
+        self.transition.clear()
+        self.actor.reset(dones)
+        self.critic.reset(dones)
 
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
-        """Insert a policy-generated AMP transition into the replay buffer.
-
-        Parameters
-        ----------
-        amp_obs : torch.Tensor
-            Next AMP observation paired with the previously stored policy state.
-        """
+        """Insert a policy-generated AMP transition into the replay buffer."""
         self.amp_storage.insert(self.amp_transition.observations, amp_obs)
         self.amp_transition.clear()
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """Compute and store GAE-lambda returns from the final observation.
-
-        Parameters
-        ----------
-        obs : TensorDict
-            Last observation gathered after rollout completion.
-        """
-        if RSL_RL_V4_PLUS:
-            # v4+ removed compute_returns from RolloutStorage
-            # (see https://github.com/leggedrobotics/rsl_rl/pull/137)
-            last_values = self.critic(obs).detach()
-            st = self.storage
-            advantage = 0
-            for step in reversed(range(st.num_transitions_per_env)):
-                next_values = (
-                    last_values
-                    if step == st.num_transitions_per_env - 1
-                    else st.values[step + 1]
-                )
-                next_is_not_terminal = 1.0 - st.dones[step].float()
-                delta = (
-                    st.rewards[step]
-                    + next_is_not_terminal * self.gamma * next_values
-                    - st.values[step]
-                )
-                advantage = (
-                    delta + next_is_not_terminal * self.gamma * self.lam * advantage
-                )
-                st.returns[step] = advantage + st.values[step]
-            st.advantages = st.returns - st.values
-            st.advantages = (st.advantages - st.advantages.mean()) / (
-                st.advantages.std() + 1e-8
-            )
-        else:
-            last_values = self.actor_critic.evaluate(obs).detach()
-            self.storage.compute_returns(last_values, self.gamma, self.lam)
+        """Compute and store GAE-lambda returns from the final observation."""
+        st = self.storage
+        critic_hidden_state = self.critic.get_hidden_state()
+        last_values = self.critic(obs).detach()
+        # Restore the critic state so the next rollout is not affected by this forward pass.
+        self.critic.reset(hidden_state=critic_hidden_state)
+        advantage = 0
+        for step in reversed(range(st.num_transitions_per_env)):
+            next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+            next_is_not_terminal = 1.0 - st.dones[step].float()
+            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+            st.returns[step] = advantage + st.values[step]
+        st.advantages = st.returns - st.values
+        if not self.normalize_advantage_per_mini_batch:
+            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(
         self,
     ) -> Tuple[float, float, float, float, float, float, float, float, float, float]:
         """
         Performs a single update step for both the actor-critic (PPO) and the AMP discriminator.
-        It iterates over mini-batches of data, computes surrogate, value, AMP and gradient penalty losses,
-        performs adaptive learning rate scheduling (if enabled), and updates model parameters.
 
         Returns
         -------
         tuple
-            A tuple containing mean losses and statistics:
             (mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss,
              mean_policy_pred, mean_expert_pred, mean_accuracy_policy, mean_accuracy_expert,
              mean_kl_divergence, mean_symmetry_loss)
         """
-        # Initialize mean loss and accuracy statistics.
         mean_value_loss: float = 0.0
         mean_surrogate_loss: float = 0.0
         mean_amp_loss: float = 0.0
@@ -495,167 +315,60 @@ class AMP_PPO:
         mean_kl_divergence: float = 0.0
         mean_symmetry_loss: float = 0.0
 
-        # Create data generators for mini-batch sampling.
-        _is_recurrent = (
-            self.actor.is_recurrent
-            if RSL_RL_V4_PLUS
-            else self.actor_critic.is_recurrent
-        )
-
-        if _is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+        if self.actor.is_recurrent or self.critic.is_recurrent:
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
-            generator = self.storage.mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # Generator for policy-generated AMP transitions.
+        mini_batch_size = self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches
         amp_policy_generator = self.amp_storage.feed_forward_generator(
             num_mini_batch=self.num_learning_epochs * self.num_mini_batches,
-            mini_batch_size=(
-                self.storage.num_envs
-                * self.storage.num_transitions_per_env
-                // self.num_mini_batches
-            ),
+            mini_batch_size=mini_batch_size,
             allow_replacement=True,
         )
-        # Generator for expert AMP data.
         amp_expert_generator = self.amp_data.feed_forward_generator(
-            self.num_learning_epochs * self.num_mini_batches,
-            self.storage.num_envs
-            * self.storage.num_transitions_per_env
-            // self.num_mini_batches,
+            self.num_learning_epochs * self.num_mini_batches, mini_batch_size
         )
 
-        # Loop over mini-batches from the environment transitions and AMP data.
-        for sample, sample_amp_policy, sample_amp_expert in zip(
-            generator, amp_policy_generator, amp_expert_generator
-        ):
-            # Unpack the mini-batch sample from the environment.
-            if hasattr(sample, "observations"):
-                obs_batch = sample.observations
-                actions_batch = sample.actions
-                target_values_batch = sample.values
-                advantages_batch = sample.advantages
-                returns_batch = sample.returns
-                old_actions_log_prob_batch = sample.old_actions_log_prob
-                old_mu_batch = sample.old_distribution_params[0]
-                old_sigma_batch = sample.old_distribution_params[1]
-                hidden_states_batch = sample.hidden_states
-                masks_batch = sample.masks
-            elif isinstance(sample, tuple) and len(sample) == 9:
-                (
-                    obs_batch,
-                    actions_batch,
-                    target_values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_distribution_params_batch,
-                    hidden_states_batch,
-                    masks_batch,
-                ) = sample
-                old_mu_batch = old_distribution_params_batch[0]
-                old_sigma_batch = old_distribution_params_batch[1]
-            else:
-                (
-                    obs_batch,
-                    actions_batch,
-                    target_values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    hidden_states_batch,
-                    masks_batch,
-                ) = sample
-
-            hidden_state_actor, hidden_state_critic = (None, None)
-            if hidden_states_batch is not None:
-                hidden_state_actor, hidden_state_critic = hidden_states_batch
+        for batch, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
+            obs_batch = batch.observations
+            actions_batch = batch.actions
+            target_values_batch = batch.values
+            advantages_batch = batch.advantages
+            returns_batch = batch.returns
+            old_actions_log_prob_batch = batch.old_actions_log_prob
+            hidden_state_actor, hidden_state_critic = batch.hidden_states
 
             original_batch_size = obs_batch.shape[0]
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
-                        advantages_batch.std() + 1e-8
-                    )
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
             # Symmetry data augmentation for PPO inputs
-            if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_data_augmentation", False
-            ):
+            if self.symmetry_cfg and self.symmetry_cfg.get("use_data_augmentation", False):
                 aug_obs, aug_actions = self._apply_symmetry(
-                    obs=obs_batch,
-                    actions=actions_batch,
-                    obs_type=["policy", "critic"],
+                    obs=obs_batch, actions=actions_batch, obs_type=["policy", "critic"]
                 )
                 num_aug = self._augment_batch_size(original_batch_size, aug_obs)
                 obs_batch = aug_obs
                 actions_batch = aug_actions
-
-                old_actions_log_prob_batch = self._repeat_along_batch(
-                    old_actions_log_prob_batch, num_aug
-                )
-                target_values_batch = self._repeat_along_batch(
-                    target_values_batch, num_aug
-                )
+                old_actions_log_prob_batch = self._repeat_along_batch(old_actions_log_prob_batch, num_aug)
+                target_values_batch = self._repeat_along_batch(target_values_batch, num_aug)
                 advantages_batch = self._repeat_along_batch(advantages_batch, num_aug)
                 returns_batch = self._repeat_along_batch(returns_batch, num_aug)
 
-            # Forward pass through the actor to get current policy outputs.
-            if RSL_RL_V4_PLUS:
-                _ = self.actor(
-                    obs_batch,
-                    masks=masks_batch,
-                    hidden_state=hidden_state_actor,
-                    stochastic_output=True,
-                )
-                actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
-                value_batch = self.critic(
-                    obs_batch, masks=masks_batch, hidden_state=hidden_state_critic
-                )
-                if hasattr(self.actor, "get_distribution_params"):
-                    dist_params = self.actor.get_distribution_params()
-                    mu_batch = dist_params[0][:original_batch_size]
-                    sigma_batch = dist_params[1][:original_batch_size]
-                    entropy_batch = self.actor.get_entropy()[:original_batch_size]
-                else:
-                    mu_batch = self.actor.output_mean[:original_batch_size]
-                    sigma_batch = self.actor.output_std[:original_batch_size]
-                    entropy_batch = self.actor.output_entropy[:original_batch_size]
-            else:
-                # v3
-                self.actor_critic.act(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_actor
-                )
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
-                    actions_batch
-                )
-                value_batch = self.actor_critic.evaluate(
-                    obs_batch, masks=masks_batch, hidden_states=hidden_state_critic
-                )
-                mu_batch = self.actor_critic.action_mean[:original_batch_size]
-                sigma_batch = self.actor_critic.action_std[:original_batch_size]
-                entropy_batch = self.actor_critic.entropy[:original_batch_size]
+            # Recompute the policy outputs with the current parameters.
+            self.actor(obs_batch, masks=batch.masks, hidden_state=hidden_state_actor, stochastic_output=True)
+            actions_log_prob_batch = self.actor.get_output_log_prob(actions_batch)
+            value_batch = self.critic(obs_batch, masks=batch.masks, hidden_state=hidden_state_critic)
+            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+            entropy_batch = self.actor.output_entropy[:original_batch_size]
 
-            # Adaptive learning rate adjustment based on KL divergence if schedule is "adaptive".
+            # Adaptive learning rate adjustment based on KL divergence.
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (
-                            torch.square(old_sigma_batch)
-                            + torch.square(old_mu_batch - mu_batch)
-                        )
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    )
+                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)
                     kl_mean = torch.mean(kl)
                     mean_kl_divergence += kl_mean.item()
 
@@ -667,56 +380,37 @@ class AMP_PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Compute the PPO surrogate loss.
-            ratio = torch.exp(
-                actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
-            )
-
+            # PPO surrogate loss.
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             min_ = 1.0 - self.clip_param
             max_ = 1.0 + self.clip_param
-            # Smooth clipping for the ratio if enabled.
             if self.use_smooth_ratio_clipping:
-                clipped_ratio = (
-                    1
-                    / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4))
-                    * (max_ - min_)
-                    + min_
-                )
+                clipped_ratio = 1 / (1 + torch.exp((-(ratio - min_) / (max_ - min_) + 0.5) * 4)) * (max_ - min_) + min_
             else:
                 clipped_ratio = torch.clamp(ratio, min_, max_)
-
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Compute the value function loss.
+            # Value function loss.
             if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (
-                    value_batch - target_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
                 value_losses = (value_batch - returns_batch).pow(2)
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            # Combine surrogate loss, value loss and entropy regularization to form PPO loss.
-            ppo_loss = (
-                surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-            )
+            ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Mirror loss (only when it actually feeds the gradient; computing it
-            # for logging only would add a full extra actor forward pass per
-            # mini-batch, inflating Perf/learning_time even when symmetry is off).
+            # Mirror loss, only computed when it feeds the gradient (it costs an extra actor pass).
             symmetry_loss_value = torch.zeros(1, device=self.device)
             if self.symmetry_cfg and self.symmetry_cfg.get("use_mirror_loss", False):
                 if not self.symmetry_cfg.get("use_data_augmentation", False):
                     sym_obs_batch, _ = self._apply_symmetry(
-                        obs=obs_batch[:original_batch_size],
-                        actions=None,
-                        obs_type="policy",
+                        obs=obs_batch[:original_batch_size], actions=None, obs_type="policy"
                     )
                 else:
                     sym_obs_batch = obs_batch
@@ -724,19 +418,9 @@ class AMP_PPO:
                 if sym_obs_batch is not None:
                     with torch.no_grad():
                         sym_obs_detached = sym_obs_batch.detach().clone()
-                    if RSL_RL_V4_PLUS:
-                        mean_actions_batch = self.actor(
-                            sym_obs_detached, stochastic_output=False
-                        )
-                    else:
-                        mean_actions_batch = self.actor_critic.act_inference(
-                            sym_obs_detached
-                        )
-                    action_mean_orig = mean_actions_batch[:original_batch_size]
+                    mean_actions_batch = self.actor(sym_obs_detached, stochastic_output=False)
                     _, sym_actions = self._apply_symmetry(
-                        obs=None,
-                        actions=action_mean_orig,
-                        obs_type="policy",
+                        obs=None, actions=mean_actions_batch[:original_batch_size], obs_type="policy"
                     )
                     if sym_actions is None:
                         sym_actions = mean_actions_batch
@@ -744,30 +428,19 @@ class AMP_PPO:
                         mean_actions_batch[original_batch_size:],
                         sym_actions.detach()[original_batch_size:],
                     )
-                    coeff = self.symmetry_cfg.get("mirror_loss_coeff", 0.0)
-                    ppo_loss = ppo_loss + coeff * symmetry_loss_value
+                    ppo_loss = ppo_loss + self.symmetry_cfg.get("mirror_loss_coeff", 0.0) * symmetry_loss_value
 
-            # Process AMP loss by unpacking policy and expert AMP samples.
+            # AMP loss.
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
 
-            if self.symmetry_cfg and self.symmetry_cfg.get(
-                "use_data_augmentation", False
-            ):
-                policy_state = self.discriminator.apply_symmetry(
-                    policy_state, obs_type="amp"
-                )
-                policy_next_state = self.discriminator.apply_symmetry(
-                    policy_next_state, obs_type="amp"
-                )
-                expert_state = self.discriminator.apply_symmetry(
-                    expert_state, obs_type="amp"
-                )
-                expert_next_state = self.discriminator.apply_symmetry(
-                    expert_next_state, obs_type="amp"
-                )
+            if self.symmetry_cfg and self.symmetry_cfg.get("use_data_augmentation", False):
+                policy_state = self.discriminator.apply_symmetry(policy_state, obs_type="amp")
+                policy_next_state = self.discriminator.apply_symmetry(policy_next_state, obs_type="amp")
+                expert_state = self.discriminator.apply_symmetry(expert_state, obs_type="amp")
+                expert_next_state = self.discriminator.apply_symmetry(expert_next_state, obs_type="amp")
 
-            # Ensure everything is on the right device (AMPLoader may yield CPU tensors)
+            # AMPLoader may yield CPU tensors.
             policy_state = policy_state.to(self.device)
             policy_next_state = policy_next_state.to(self.device)
             expert_state = expert_state.to(self.device)
@@ -779,7 +452,6 @@ class AMP_PPO:
             expert_state_raw = expert_state.detach().clone()
             expert_next_state_raw = expert_next_state.detach().clone()
 
-            # Concatenate policy and expert AMP observations for the discriminator input.
             B_pol = policy_state.size(0)
             discriminator_input = torch.cat(
                 (
@@ -789,12 +461,8 @@ class AMP_PPO:
                 dim=0,
             )
             discriminator_output = self.discriminator(discriminator_input)
-            policy_d, expert_d = (
-                discriminator_output[:B_pol],
-                discriminator_output[B_pol:],
-            )
+            policy_d, expert_d = discriminator_output[:B_pol], discriminator_output[B_pol:]
 
-            # Compute discriminator losses
             amp_loss, grad_pen_loss = self.discriminator.compute_loss(
                 policy_d=policy_d,
                 expert_d=expert_d,
@@ -803,34 +471,22 @@ class AMP_PPO:
                 lambda_=10,
             )
 
-            # The final loss combines the PPO loss with AMP losses.
             loss = ppo_loss + (amp_loss + grad_pen_loss)
 
-            # Backpropagation and optimizer step.
             self.optimizer.zero_grad()
             loss.backward()
-            if RSL_RL_V4_PLUS:
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            else:
-                nn.utils.clip_grad_norm_(
-                    self.actor_critic.parameters(), self.max_grad_norm
-                )
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            # Update the normalizer with RAW (unnormalized) observations under no_grad
+            # Update the normalizer with RAW (unnormalized) observations
             self.discriminator.update_normalization(
-                expert_state_raw,
-                expert_next_state_raw,
-                policy_state_raw,
-                policy_next_state_raw,
+                expert_state_raw, expert_next_state_raw, policy_state_raw, policy_next_state_raw
             )
 
-            # Compute probabilities from the discriminator logits.
             policy_d_prob = torch.sigmoid(policy_d)
             expert_d_prob = torch.sigmoid(expert_d)
 
-            # Update running statistics.
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_amp_loss += amp_loss.item()
@@ -839,19 +495,11 @@ class AMP_PPO:
             mean_expert_pred += expert_d_prob.mean().item()
             mean_symmetry_loss += symmetry_loss_value.item()
 
-            # Calculate the accuracy of the discriminator.
-            mean_accuracy_policy += torch.sum(
-                torch.round(policy_d_prob) == torch.zeros_like(policy_d_prob)
-            ).item()
-            mean_accuracy_expert += torch.sum(
-                torch.round(expert_d_prob) == torch.ones_like(expert_d_prob)
-            ).item()
-
-            # Record the total number of elements processed.
+            mean_accuracy_policy += torch.sum(torch.round(policy_d_prob) == torch.zeros_like(policy_d_prob)).item()
+            mean_accuracy_expert += torch.sum(torch.round(expert_d_prob) == torch.ones_like(expert_d_prob)).item()
             mean_accuracy_expert_elem += expert_d_prob.numel()
             mean_accuracy_policy_elem += policy_d_prob.numel()
 
-        # Average the statistics over all mini-batches.
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
@@ -864,7 +512,6 @@ class AMP_PPO:
         mean_kl_divergence /= num_updates
         mean_symmetry_loss /= num_updates
 
-        # Clear the storage for the next update cycle.
         self.storage.clear()
 
         return (

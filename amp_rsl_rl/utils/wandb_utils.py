@@ -3,10 +3,8 @@ import warnings
 import wandb
 from torch.utils.tensorboard import SummaryWriter
 
-from amp_rsl_rl.utils._compat import (
-    WandbSummaryWriterBase as RslWandbSummaryWriter,
-    RSL_RL_WANDB_HAS_LOG_CONFIG,
-)
+from rsl_rl.utils import WandbLogWriter as RslWandbSummaryWriter
+
 
 class WandbSummaryWriter(RslWandbSummaryWriter):
     def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
@@ -59,20 +57,19 @@ class WandbSummaryWriter(RslWandbSummaryWriter):
         }
 
         self.video_files = []
-        # rsl-rl v5's Logger.save_video (inherited) tracks uploads here.
+        # Tracks uploads done by the inherited save_video.
         self.logged_videos: set[str] = set()
 
         self.update_run_name_with_sequence(prefix=project)
 
+    def store_config(self, env_cfg, train_cfg) -> None:
+        """rsl-rl 5 writer interface (also used by Isaac Lab's runners)."""
+        self.log_config(env_cfg, train_cfg, train_cfg.get("algorithm"), {
+            "actor": train_cfg.get("actor"), "critic": train_cfg.get("critic")
+        })
 
-    # Provide a ``log_config`` API compatible with both rsl-rl versions. Older
-    # releases implement it on the base writer; rsl-rl v5 removed it, so fall
-    # back to replicating the legacy behavior. The AMP runner calls this once
-    # at startup with the environment, runner, algorithm and policy configs.
     def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg) -> None:
-        if RSL_RL_WANDB_HAS_LOG_CONFIG:
-            super().log_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
-            return
+        """Upload the environment, runner, algorithm and policy configs to wandb."""
         try:
             wandb.config.update(
                 {

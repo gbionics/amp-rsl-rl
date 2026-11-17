@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import statistics
 import time
@@ -19,48 +20,31 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
 from rsl_rl.env import VecEnv
+from rsl_rl.models import CNNModel, MLPModel, RNNModel
+from rsl_rl.utils import resolve_obs_groups
 
 import amp_rsl_rl
-from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation
+from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation, store_code_state
 from amp_rsl_rl.algorithms import AMP_PPO
-from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
+from amp_rsl_rl.networks import Discriminator, MoEModel
 from amp_rsl_rl.utils import export_policy_as_onnx
-from amp_rsl_rl.utils._compat import (
-    RSL_RL_V4_PLUS,
-    store_code_state,
-    resolve_obs_groups,
-)
-
-if RSL_RL_V4_PLUS:
-    from rsl_rl.models import MLPModel
-
-    _v4_builtin_classes = {"MLPModel": MLPModel}
-else:
-    from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
-
-    _v4_builtin_classes = {}
 
 # Built-in classes available for short-name resolution
 _BUILTIN_CLASSES = {
-    "ActorCriticMoE": ActorCriticMoE,
+    "MLPModel": MLPModel,
+    "RNNModel": RNNModel,
+    "CNNModel": CNNModel,
+    "MoEModel": MoEModel,
     "AMP_PPO": AMP_PPO,
-    **_v4_builtin_classes,
 }
-if not RSL_RL_V4_PLUS:
-    _BUILTIN_CLASSES.update(
-        {
-            "ActorCritic": ActorCritic,
-            "ActorCriticRecurrent": ActorCriticRecurrent,
-        }
-    )
 
 
 def resolve_class(class_name: str) -> type:
     """Resolve a class by name.
 
     Supports:
-    - Built-in short names: ``"ActorCritic"``, ``"ActorCriticMoE"``, etc.
-    - Fully-qualified dotted paths: ``"my_package.networks.MyClass"``.
+    - Built-in short names: ``"MLPModel"``, ``"MoEModel"``, ``"AMP_PPO"``, etc.
+    - Fully-qualified paths: ``"my_package.networks.MyClass"`` or ``"my_package.networks:MyClass"``.
 
     Args:
         class_name: Either a short built-in name or a fully-qualified
@@ -76,9 +60,9 @@ def resolve_class(class_name: str) -> type:
     if class_name in _BUILTIN_CLASSES:
         return _BUILTIN_CLASSES[class_name]
 
-    # 2. Try fully-qualified import  (e.g. "pkg.mod.ClassName")
-    if "." in class_name:
-        module_path, cls_name = class_name.rsplit(".", 1)
+    # 2. Try fully-qualified import  (e.g. "pkg.mod.ClassName" or "pkg.mod:ClassName")
+    if "." in class_name or ":" in class_name:
+        module_path, cls_name = class_name.replace(":", ".").rsplit(".", 1)
         try:
             module = importlib.import_module(module_path)
             return getattr(module, cls_name)
@@ -99,7 +83,7 @@ class AMPOnPolicyRunner:
 
     It brings together multiple components:
     - Environment (`VecEnv`)
-    - Policy (`ActorCritic`, `ActorCriticRecurrent`)
+    - Actor and critic models (`rsl_rl.models` models, e.g. `MLPModel`, or `MoEModel`)
     - Discriminator (Discriminator)
     - Expert dataset (AMPLoader)
     - Reward combination (task + style)
@@ -109,9 +93,9 @@ class AMPOnPolicyRunner:
     🔧 Configuration
     ----------------
     The class expects a `train_cfg` dictionary structured with keys:
-    - "obs_groups": optional mapping describing which observation tensors belong to "policy" and "critic" inputs.
-    - "policy": configuration for the policy network, including `"class_name"`
-    - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`
+    - "obs_groups": optional mapping describing which observation tensors belong to "actor" and "critic" inputs.
+    - "actor" / "critic": configuration for the models, including `"class_name"`
+    - "algorithm": configuration for AMP_PPO, including `"class_name"`
     - "discriminator": configuration for the AMP discriminator
     - "dataset": dictionary forwarded to `AMPLoader`, containing at least:
         * "amp_data_path": folder with the `.npy` expert datasets
@@ -122,8 +106,7 @@ class AMPOnPolicyRunner:
           for base velocities in discriminator observations. Default: "body_fixed"
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
-    - "empirical_normalization": (deprecated) legacy flag mirrored to `policy.actor_obs_normalization`
-    - "logger": one of "tensorboard", "wandb", or "neptune"
+    - "logger": one of "tensorboard", "wandb", "mlflow" or "neptune"
 
     ---
     📦 Dataset format
@@ -137,7 +120,7 @@ class AMPOnPolicyRunner:
     - `"fps"`: float — original dataset frame rate
 
     Internally:
-    - Quaternions are interpolated via SLERP and converted to **`wxyz`** format before being used by the model (to match Isaac Gym convention).
+    - Quaternions are interpolated via SLERP and kept in **`xyzw`** format (Isaac Lab 3 convention).
     - Velocities are estimated with finite differences.
     - All data is converted to torch tensors and placed on the desired device.
 
@@ -207,62 +190,28 @@ class AMPOnPolicyRunner:
         self._export_policy_fn: Callable | None = None
 
         observations = self.env.get_observations()
-        default_sets = ["critic"]
+        default_sets = ["actor", "critic"]
         self.cfg["obs_groups"] = resolve_obs_groups(
             observations, self.cfg.get("obs_groups"), default_sets
         )
 
-        if RSL_RL_V4_PLUS:
-            self.actor_cfg = train_cfg["actor"]
-            self.critic_cfg = train_cfg["critic"]
-            self.policy_cfg = {"actor": self.actor_cfg, "critic": self.critic_cfg}
+        self.actor_cfg = dict(train_cfg["actor"])
+        self.critic_cfg = dict(train_cfg["critic"])
+        self.policy_cfg = {"actor": self.actor_cfg, "critic": self.critic_cfg}
 
-            actor_class = resolve_class(self.actor_cfg.pop("class_name", "MLPModel"))
-            critic_class = resolve_class(self.critic_cfg.pop("class_name", "MLPModel"))
+        actor_class = resolve_class(self.actor_cfg.pop("class_name", "MLPModel"))
+        critic_class = resolve_class(self.critic_cfg.pop("class_name", "MLPModel"))
 
-            # Filter config dicts to only contain kwargs accepted by the resolved class
-            import inspect
+        # Keep only the kwargs accepted by the resolved classes (Isaac Lab cfgs carry extras).
+        actor_valid_keys = set(inspect.signature(actor_class.__init__).parameters)
+        critic_valid_keys = set(inspect.signature(critic_class.__init__).parameters)
+        actor_kwargs = {k: v for k, v in self.actor_cfg.items() if k in actor_valid_keys}
+        critic_kwargs = {k: v for k, v in self.critic_cfg.items() if k in critic_valid_keys}
 
-            actor_valid_keys = set(
-                inspect.signature(actor_class.__init__).parameters.keys()
-            )
-            critic_valid_keys = set(
-                inspect.signature(critic_class.__init__).parameters.keys()
-            )
-            self.actor_cfg = {
-                k: v for k, v in self.actor_cfg.items() if k in actor_valid_keys
-            }
-            self.critic_cfg = {
-                k: v for k, v in self.critic_cfg.items() if k in critic_valid_keys
-            }
-
-            actor = actor_class(
-                observations,
-                self.cfg["obs_groups"],
-                "actor",
-                self.env.num_actions,
-                **self.actor_cfg,
-            ).to(self.device)
-            critic = critic_class(
-                observations,
-                self.cfg["obs_groups"],
-                "critic",
-                1,
-                **self.critic_cfg,
-            ).to(self.device)
-        else:
-            self.policy_cfg = train_cfg["policy"]
-            self.actor_cfg = {}
-            self.critic_cfg = {}
-
-            actor_critic_class = resolve_class(self.policy_cfg.pop("class_name"))
-            # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
-            actor_critic = actor_critic_class(
-                observations,
-                self.cfg["obs_groups"],
-                self.env.num_actions,
-                **self.policy_cfg,
-            ).to(self.device)
+        actor = actor_class(
+            observations, self.cfg["obs_groups"], "actor", self.env.num_actions, **actor_kwargs
+        ).to(self.device)
+        critic = critic_class(observations, self.cfg["obs_groups"], "critic", 1, **critic_kwargs).to(self.device)
 
         amp_joint_names = self.dataset_cfg.get("amp_joint_names", None)
         if amp_joint_names is None:
@@ -332,32 +281,20 @@ class AMPOnPolicyRunner:
 
         # Initialize the PPO algorithm
         alg_class = resolve_class(self.alg_cfg.pop("class_name"))
-        # This removes from alg_cfg fields that are not in AMP_PPO but are introduced in rsl_rl 2.2.3 PPO
-        # normalize_advantage_per_mini_batch=False,
-        # rnd_cfg: dict | None = None,
-        # symmetry_cfg: dict | None = None,
-        # multi_gpu_cfg: dict | None = None,
+        # Drop upstream PPO options AMP_PPO does not implement (e.g. rnd_cfg, multi_gpu_cfg, optimizer).
+        alg_params = inspect.signature(alg_class.__init__).parameters
         for key in list(self.alg_cfg.keys()):
-            if key not in AMP_PPO.__init__.__code__.co_varnames:
+            if key not in alg_params:
                 self.alg_cfg.pop(key)
 
-        if RSL_RL_V4_PLUS:
-            self.alg: AMP_PPO = alg_class(
-                actor=actor,
-                critic=critic,
-                discriminator=self.discriminator,
-                amp_data=amp_data,
-                device=self.device,
-                **self.alg_cfg,
-            )
-        else:
-            self.alg: AMP_PPO = alg_class(
-                actor_critic=actor_critic,
-                discriminator=self.discriminator,
-                amp_data=amp_data,
-                device=self.device,
-                **self.alg_cfg,
-            )
+        self.alg: AMP_PPO = alg_class(
+            actor=actor,
+            critic=critic,
+            discriminator=self.discriminator,
+            amp_data=amp_data,
+            device=self.device,
+            **self.alg_cfg,
+        )
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -404,14 +341,12 @@ class AMPOnPolicyRunner:
             self.logger_type = self.logger_type.lower()
 
             if self.logger_type == "neptune":
-                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+                from rsl_rl.utils import NeptuneLogWriter
 
-                self.writer = NeptuneSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                self.writer = NeptuneLogWriter(
+                    log_dir=self.log_dir, project_name=self.cfg.get("neptune_project", "isaaclab")
                 )
-                self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
-                )
+                self.writer.store_config(self.env.cfg, self.cfg)
             elif self.logger_type == "wandb":
                 from amp_rsl_rl.utils.wandb_utils import WandbSummaryWriter
 
@@ -601,15 +536,13 @@ class AMPOnPolicyRunner:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        _policy_ref = self.alg.actor if RSL_RL_V4_PLUS else self.alg.actor_critic
-        if hasattr(_policy_ref, "distribution") and hasattr(
-            _policy_ref.distribution, "std_param"
-        ):
-            mean_std_value = _policy_ref.distribution.std_param.mean()
-        elif getattr(_policy_ref, "noise_std_type", "scalar") == "log":
-            mean_std_value = torch.exp(_policy_ref.log_std).mean()
+        distribution = getattr(self.alg.actor, "distribution", None)
+        if hasattr(distribution, "std_param"):
+            mean_std_value = distribution.std_param.mean()
+        elif hasattr(distribution, "log_std_param"):
+            mean_std_value = torch.exp(distribution.log_std_param).mean()
         else:
-            mean_std_value = _policy_ref.std.mean()
+            mean_std_value = self.alg.actor.output_std.mean()
         fps = int(
             self.num_steps_per_env
             * self.env.num_envs
@@ -740,7 +673,7 @@ class AMPOnPolicyRunner:
 
         The callable must have the signature::
 
-            fn(actor_critic, normalizer=..., path=..., filename=...)
+            fn(actor, normalizer=..., path=..., filename=...)
 
         If not set, the built-in ``export_policy_as_onnx`` from
         ``amp_rsl_rl.utils`` is used.
@@ -748,23 +681,14 @@ class AMPOnPolicyRunner:
         self._export_policy_fn = fn
 
     def save(self, path, infos=None, save_onnx=False):
-        if RSL_RL_V4_PLUS:
-            saved_dict = {
-                "actor_state_dict": self.alg.actor.state_dict(),
-                "critic_state_dict": self.alg.critic.state_dict(),
-                "optimizer_state_dict": self.alg.optimizer.state_dict(),
-                "discriminator_state_dict": self.alg.discriminator.state_dict(),
-                "iter": self.current_learning_iteration,
-                "infos": infos,
-            }
-        else:
-            saved_dict = {
-                "model_state_dict": self.alg.actor_critic.state_dict(),
-                "optimizer_state_dict": self.alg.optimizer.state_dict(),
-                "discriminator_state_dict": self.alg.discriminator.state_dict(),
-                "iter": self.current_learning_iteration,
-                "infos": infos,
-            }
+        saved_dict = {
+            "actor_state_dict": self.alg.actor.state_dict(),
+            "critic_state_dict": self.alg.critic.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -780,15 +704,8 @@ class AMPOnPolicyRunner:
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
 
-            if RSL_RL_V4_PLUS:
-                _module = self.alg.actor
-            else:
-                _module = self.alg.actor_critic
-            _normalizer = getattr(
-                _module,
-                "actor_obs_normalizer",
-                getattr(_module, "obs_normalizer", None),
-            )
+            _module = self.alg.actor
+            _normalizer = getattr(_module, "obs_normalizer", None)
 
             _export_fn = self._export_policy_fn or export_policy_as_onnx
             _export_fn(
@@ -824,24 +741,17 @@ class AMPOnPolicyRunner:
             weights_only=weights_only,
         )
 
-        if RSL_RL_V4_PLUS:
-            do_load_actor = load_cfg.get("actor", True)
-            do_load_critic = load_cfg.get("critic", True)
-            do_load_discriminator = load_cfg.get("discriminator", True)
+        do_load_actor = load_cfg.get("actor", True)
+        do_load_critic = load_cfg.get("critic", True)
+        do_load_discriminator = load_cfg.get("discriminator", True)
 
-            if do_load_actor and "actor_state_dict" in loaded_dict:
-                actor_state = loaded_dict["actor_state_dict"]
-                if "std" in actor_state and "distribution.std_param" not in actor_state:
-                    actor_state["distribution.std_param"] = actor_state.pop("std")
-                self.alg.actor.load_state_dict(actor_state, strict=strict)
-            if do_load_critic and "critic_state_dict" in loaded_dict:
-                self.alg.critic.load_state_dict(
-                    loaded_dict["critic_state_dict"], strict=strict
-                )
-        else:
-            do_load_discriminator = load_cfg.get("discriminator", True)
-            if "model_state_dict" in loaded_dict:
-                self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+        if do_load_actor and "actor_state_dict" in loaded_dict:
+            actor_state = loaded_dict["actor_state_dict"]
+            if "std" in actor_state and "distribution.std_param" not in actor_state:
+                actor_state["distribution.std_param"] = actor_state.pop("std")
+            self.alg.actor.load_state_dict(actor_state, strict=strict)
+        if do_load_critic and "critic_state_dict" in loaded_dict:
+            self.alg.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
 
         if do_load_discriminator and "discriminator_state_dict" in loaded_dict:
             discriminator_state = loaded_dict["discriminator_state_dict"]
@@ -865,29 +775,16 @@ class AMPOnPolicyRunner:
 
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
-        if RSL_RL_V4_PLUS:
-            if device is not None:
-                self.alg.actor.to(device)
-            return lambda obs: self.alg.actor(obs, stochastic_output=False)
-        else:
-            if device is not None:
-                self.alg.actor_critic.to(device)
-            return self.alg.actor_critic.act_inference
+        if device is not None:
+            self.alg.actor.to(device)
+        return self.alg.actor
 
     def train_mode(self):
-        if RSL_RL_V4_PLUS:
-            self.alg.actor.train()
-            self.alg.critic.train()
-        else:
-            self.alg.actor_critic.train()
+        self.alg.train_mode()
         self.alg.discriminator.train()
 
     def eval_mode(self):
-        if RSL_RL_V4_PLUS:
-            self.alg.actor.eval()
-            self.alg.critic.eval()
-        else:
-            self.alg.actor_critic.eval()
+        self.alg.test_mode()
         self.alg.discriminator.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
