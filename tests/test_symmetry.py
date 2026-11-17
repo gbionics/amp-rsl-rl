@@ -124,6 +124,22 @@ class TestCallAugmentationFunc:
         assert aug_obs.shape == (8, 3)
         assert aug_actions is None
 
+    def test_env_forwarded_to_upstream_signature(self):
+        """rsl-rl >= 5 augmentation functions take ``env`` as first argument."""
+        env = object()
+        received = {}
+
+        def upstream_fn(env, obs, actions):
+            received["env"] = env
+            return _mirror_obs_and_actions(obs, actions)
+
+        aug_obs, aug_actions = _call_augmentation_func(
+            upstream_fn, obs=torch.ones(4, 3), actions=torch.ones(4, 2), obs_type="policy", env=env
+        )
+        assert received["env"] is env
+        assert aug_obs.shape == (8, 3)
+        assert aug_actions.shape == (8, 2)
+
 
 # ── Tests for Discriminator.apply_symmetry ───────────────────────────────────
 

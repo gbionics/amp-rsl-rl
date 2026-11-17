@@ -139,3 +139,27 @@ def test_learn_save_load(dataset_dir, actor_class):
         other = AMPOnPolicyRunner(env, copy.deepcopy(cfg), log_dir=None)
         other.load(str(checkpoint))
         torch.testing.assert_close(other.get_inference_policy()(obs), policy(obs))
+        assert other.alg.learning_rate == runner.alg.learning_rate
+
+
+def test_normalizer_frozen_during_rollout(dataset_dir):
+    """As in rsl-rl >= 5, observation normalizers only change at the end of update()."""
+    env = FakeEnv(_amp_dim(dataset_dir))
+    runner = AMPOnPolicyRunner(env, _train_cfg(dataset_dir), log_dir=None)
+    alg = runner.alg
+    normalizer = alg.get_policy().obs_normalizer
+    obs = env.get_observations()
+    amp_obs = obs["amp"]
+    with torch.inference_mode():
+        for _ in range(runner.num_steps_per_env):
+            alg.act(obs)
+            alg.act_amp(amp_obs)
+            obs, rewards, dones, extras = env.step(torch.zeros(NUM_ENVS, NUM_JOINTS))
+            alg.process_env_step(obs, rewards, dones, extras)
+            alg.process_amp_step(obs["amp"])
+            amp_obs = obs["amp"]
+        assert normalizer.count.item() == 0
+        alg.compute_returns(obs)
+    loss_dict = alg.update()
+    assert normalizer.count.item() == runner.num_steps_per_env * NUM_ENVS
+    assert {"value_function", "surrogate", "entropy", "amp_loss", "symmetry"} <= loss_dict.keys()

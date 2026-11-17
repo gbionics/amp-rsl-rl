@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import torch
@@ -33,7 +34,11 @@ def export_policy_as_onnx(
         verbose: Whether to print the model summary. Defaults to False.
     """
     os.makedirs(path, exist_ok=True)
-    onnx_model = model.as_onnx(verbose=verbose)
+    # rsl-rl 5.5.1 takes ``as_onnx(verbose)``, later releases ``as_onnx()``.
+    if "verbose" in inspect.signature(model.as_onnx).parameters:
+        onnx_model = model.as_onnx(verbose=verbose)
+    else:
+        onnx_model = model.as_onnx()
     onnx_model.to("cpu")
     onnx_model.eval()
     torch.onnx.export(
