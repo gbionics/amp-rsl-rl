@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Istituto Italiano di Tecnologia
+# Copyright (c) 2026, Generative Bionics S.r.l.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
