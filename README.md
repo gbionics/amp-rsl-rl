@@ -37,6 +37,14 @@ If you want to run the examples, please install with:
 pip install .[examples]
 ```
 
+For development, a [pixi](https://pixi.sh) workspace is provided (CPU-only PyTorch). Run the tests
+against the latest supported rsl-rl, or against the oldest one (5.5.1) with:
+
+```bash
+pixi run test
+pixi run -e rsl-rl-min test
+```
+
 The required dependencies include:
 
 - `numpy`
@@ -51,6 +59,11 @@ configs (`class_name` can be any `rsl_rl.models` model, e.g. `MLPModel`, or
 `amp_rsl_rl.networks:MoEModel` for a Mixture-of-Experts actor), observation groups
 `actor`/`critic`/`amp`, and quaternions in `xyzw` order (Isaac Lab 3 convention).
 Older rsl-rl releases (`ActorCritic`, `policy` config) are no longer supported.
+
+`AMP_PPO` mirrors upstream `PPO`: observation normalizers are updated once per iteration after the
+update (not during the rollout), and the `optimizer`, `use_mixed_precision`, `share_cnn_encoders`,
+`torch_compile_mode` and `check_for_nan` options are honored. Multi-GPU training and RND are not
+supported.
 
 ---
 

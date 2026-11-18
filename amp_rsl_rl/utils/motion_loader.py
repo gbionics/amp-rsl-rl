@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Istituto Italiano di Tecnologia
+# Copyright (c) 2026, Generative Bionics S.r.l.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -81,9 +82,14 @@ def _call_augmentation_func(
     obs: Optional[torch.Tensor] = None,
     actions: Optional[torch.Tensor] = None,
     obs_type: Any = None,
+    env: Any = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     parameters = inspect.signature(fn).parameters
     kwargs: Dict[str, Any] = {}
+
+    # Upstream rsl-rl (>= 5) augmentation functions take the environment as first argument.
+    if "env" in parameters:
+        kwargs["env"] = env
 
     if "obs" in parameters:
         kwargs["obs"] = obs

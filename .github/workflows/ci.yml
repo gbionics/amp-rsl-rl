@@ -12,24 +12,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rsl-rl-version: ["5.5.1"]
-        python-version: ["3.12"]
+        environment: [default, rsl-rl-min]
 
-    name: rsl-rl-lib ${{ matrix.rsl-rl-version }}
+    name: tests (${{ matrix.environment }})
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: 📦 Set up pixi
+        uses: prefix-dev/setup-pixi@v0.11.3
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: 📦 Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install "rsl-rl-lib==${{ matrix.rsl-rl-version }}"
-          pip install -e ".[examples,mlflow,wandb]"
-          pip install pytest
+          environments: ${{ matrix.environment }}
+          locked: true
+          cache: true
 
       - name: 🧪 Run tests
-        run: python -m pytest tests/ -v
+        run: pixi run -e ${{ matrix.environment }} test

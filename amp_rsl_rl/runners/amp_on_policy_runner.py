@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Istituto Italiano di Tecnologia
+# Copyright (c) 2026, Generative Bionics S.r.l.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -21,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 import rsl_rl
 from rsl_rl.env import VecEnv
 from rsl_rl.models import CNNModel, MLPModel, RNNModel
-from rsl_rl.utils import resolve_obs_groups
+from rsl_rl.utils import check_nan, resolve_obs_groups
 
 import amp_rsl_rl
 from amp_rsl_rl.utils import AMPLoader, VelocityRepresentation, store_code_state
@@ -211,6 +212,8 @@ class AMPOnPolicyRunner:
         actor = actor_class(
             observations, self.cfg["obs_groups"], "actor", self.env.num_actions, **actor_kwargs
         ).to(self.device)
+        if self.alg_cfg.pop("share_cnn_encoders", None):
+            critic_kwargs["cnns"] = actor.cnns
         critic = critic_class(observations, self.cfg["obs_groups"], "critic", 1, **critic_kwargs).to(self.device)
 
         amp_joint_names = self.dataset_cfg.get("amp_joint_names", None)
@@ -281,11 +284,16 @@ class AMPOnPolicyRunner:
 
         # Initialize the PPO algorithm
         alg_class = resolve_class(self.alg_cfg.pop("class_name"))
-        # Drop upstream PPO options AMP_PPO does not implement (e.g. rnd_cfg, multi_gpu_cfg, optimizer).
+        # Drop upstream PPO options AMP_PPO does not implement (e.g. rnd_cfg, multi_gpu_cfg).
         alg_params = inspect.signature(alg_class.__init__).parameters
         for key in list(self.alg_cfg.keys()):
             if key not in alg_params:
                 self.alg_cfg.pop(key)
+
+        alg_kwargs = dict(self.alg_cfg)
+        # As upstream, the symmetry function receives the env; a copy keeps it out of the logged cfg.
+        if alg_kwargs.get("symmetry_cfg") is not None:
+            alg_kwargs["symmetry_cfg"] = {**alg_kwargs["symmetry_cfg"], "env": self.env}
 
         self.alg: AMP_PPO = alg_class(
             actor=actor,
@@ -293,8 +301,9 @@ class AMPOnPolicyRunner:
             discriminator=self.discriminator,
             amp_data=amp_data,
             device=self.device,
-            **self.alg_cfg,
+            **alg_kwargs,
         )
+        self.alg.compile(self.cfg.get("torch_compile_mode"))
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -415,6 +424,8 @@ class AMPOnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(
                         actions.to(self.env.device)
                     )
+                    if self.cfg.get("check_for_nan", True):
+                        check_nan(obs, rewards, dones)
                     obs = obs.to(self.device)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
@@ -474,18 +485,7 @@ class AMPOnPolicyRunner:
             )
             mean_task_reward_log = mean_task_reward_log.item() / self.num_steps_per_env
 
-            (
-                mean_value_loss,
-                mean_surrogate_loss,
-                mean_amp_loss,
-                mean_grad_pen_loss,
-                mean_policy_pred,
-                mean_expert_pred,
-                mean_accuracy_policy,
-                mean_accuracy_expert,
-                mean_kl_divergence,
-                mean_symmetry_loss,
-            ) = self.alg.update()
+            loss_dict = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -536,45 +536,23 @@ class AMPOnPolicyRunner:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        distribution = getattr(self.alg.actor, "distribution", None)
+        distribution = getattr(self.alg.get_policy(), "distribution", None)
         if hasattr(distribution, "std_param"):
             mean_std_value = distribution.std_param.mean()
         elif hasattr(distribution, "log_std_param"):
             mean_std_value = torch.exp(distribution.log_std_param).mean()
         else:
-            mean_std_value = self.alg.actor.output_std.mean()
+            mean_std_value = self.alg.get_policy().output_std.mean()
         fps = int(
             self.num_steps_per_env
             * self.env.num_envs
             / (locs["collection_time"] + locs["learn_time"])
         )
 
-        self.writer.add_scalar(
-            "Loss/value_function", locs["mean_value_loss"], locs["it"]
-        )
-        self.writer.add_scalar(
-            "Loss/surrogate", locs["mean_surrogate_loss"], locs["it"]
-        )
-
-        # Adding logging due to AMP
-        self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
-        self.writer.add_scalar(
-            "Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"]
-        )
-        self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
-        self.writer.add_scalar("Loss/expert_pred", locs["mean_expert_pred"], locs["it"])
-        self.writer.add_scalar(
-            "Loss/accuracy_policy", locs["mean_accuracy_policy"], locs["it"]
-        )
-        self.writer.add_scalar(
-            "Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"]
-        )
-
+        loss_dict = locs["loss_dict"]
+        for key, value in loss_dict.items():
+            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-        self.writer.add_scalar(
-            "Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"]
-        )
-        self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
         self.writer.add_scalar(
             "Policy/mean_noise_std", mean_std_value.item(), locs["it"]
         )
@@ -617,34 +595,22 @@ class AMPOnPolicyRunner:
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
+        log_string = (
+            f"""{'#' * width}\n"""
+            f"""{str.center(width, ' ')}\n\n"""
+            f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                        'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+            f"""{'Value function loss:':>{pad}} {loss_dict['value_function']:.4f}\n"""
+            f"""{'Surrogate loss:':>{pad}} {loss_dict['surrogate']:.4f}\n"""
+            f"""{'Entropy:':>{pad}} {loss_dict['entropy']:.4f}\n"""
+            f"""{'Symmetry loss:':>{pad}} {loss_dict['symmetry']:.4f}\n"""
+            f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
+        )
         if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
+            log_string += (
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
-        else:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std_value.item():.2f}\n"""
-            )
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
 
@@ -682,8 +648,8 @@ class AMPOnPolicyRunner:
 
     def save(self, path, infos=None, save_onnx=False):
         saved_dict = {
-            "actor_state_dict": self.alg.actor.state_dict(),
-            "critic_state_dict": self.alg.critic.state_dict(),
+            "actor_state_dict": self.alg.get_policy().state_dict(),
+            "critic_state_dict": self.alg._raw_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "discriminator_state_dict": self.alg.discriminator.state_dict(),
             "iter": self.current_learning_iteration,
@@ -704,7 +670,7 @@ class AMPOnPolicyRunner:
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
 
-            _module = self.alg.actor
+            _module = self.alg.get_policy()
             _normalizer = getattr(_module, "obs_normalizer", None)
 
             _export_fn = self._export_policy_fn or export_policy_as_onnx
@@ -749,9 +715,9 @@ class AMPOnPolicyRunner:
             actor_state = loaded_dict["actor_state_dict"]
             if "std" in actor_state and "distribution.std_param" not in actor_state:
                 actor_state["distribution.std_param"] = actor_state.pop("std")
-            self.alg.actor.load_state_dict(actor_state, strict=strict)
+            self.alg.get_policy().load_state_dict(actor_state, strict=strict)
         if do_load_critic and "critic_state_dict" in loaded_dict:
-            self.alg.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+            self.alg._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
 
         if do_load_discriminator and "discriminator_state_dict" in loaded_dict:
             discriminator_state = loaded_dict["discriminator_state_dict"]
@@ -769,15 +735,18 @@ class AMPOnPolicyRunner:
 
         if do_load_optimizer and "optimizer_state_dict" in loaded_dict:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # Resume the adaptive learning rate from the checkpoint.
+            self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
         if "iter" in loaded_dict:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict.get("infos")
 
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
+        policy = self.alg.get_policy()
         if device is not None:
-            self.alg.actor.to(device)
-        return self.alg.actor
+            policy.to(device)
+        return policy
 
     def train_mode(self):
         self.alg.train_mode()
