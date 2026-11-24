@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Generative Bionics S.R.L.
+# SPDX-License-Identifier: BSD-3-Clause
+
 # Copyright (c) 2025, Istituto Italiano di Tecnologia
 # Copyright (c) 2026, Generative Bionics S.r.l.
 # All rights reserved.
@@ -105,6 +108,10 @@ class AMPOnPolicyRunner:
           either a scalar or one value per dataset in the order of "datasets"
         * "velocity_representation": (optional) "body_fixed" or "mixed" — frame convention
           for base velocities in discriminator observations. Default: "body_fixed"
+        * "amp_obs_components": (optional) ordered list of discriminator observation
+          components. It must match the order of the terms in `observations["amp"]`.
+        * "body_links_names" / "anchor_body_name": (optional) body keyframes to use when
+          "amp_obs_components" contains any of the `body_*` components.
     - "num_steps_per_env": rollout horizon per environment
     - "save_interval": frequency (in iterations) for model checkpointing
     - "logger": one of "tensorboard", "wandb", "mlflow" or "neptune"
@@ -269,7 +276,21 @@ class AMPOnPolicyRunner:
             symmetry_cfg=self.alg_cfg.get("symmetry_cfg"),
             num_frames=self.amp_num_frames,
             frame_stride=self.amp_frame_stride,
+            amp_obs_components=self.dataset_cfg.get("amp_obs_components"),
+            body_links_names=self.dataset_cfg.get("body_links_names"),
+            anchor_body_name=self.dataset_cfg.get("anchor_body_name"),
         )
+
+        # all_obs holds num_frames - 1 frames per sample, all_next_obs a single frame.
+        num_dataset_amp_obs = amp_data.all_next_obs.shape[1]
+        if num_dataset_amp_obs != num_amp_obs:
+            raise ValueError(
+                f"The AMP observation of the environment has {num_amp_obs} elements while "
+                f"the expert dataset produces {num_dataset_amp_obs} elements "
+                f"(amp_obs_components={self.dataset_cfg.get('amp_obs_components')}, "
+                f"body_links_names={self.dataset_cfg.get('body_links_names')}). Make sure "
+                "the env 'amp' observation group and the dataset configuration match."
+            )
 
         self.discriminator = Discriminator(
             input_dim=num_amp_obs * self.amp_num_frames,

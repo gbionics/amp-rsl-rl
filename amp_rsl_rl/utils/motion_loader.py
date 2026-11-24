@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Generative Bionics S.R.L.
+# SPDX-License-Identifier: BSD-3-Clause
+
 # Copyright (c) 2025, Istituto Italiano di Tecnologia
 # Copyright (c) 2026, Generative Bionics S.r.l.
 # All rights reserved.
@@ -109,6 +112,11 @@ def _call_augmentation_func(
     return result, None
 
 
+_DEFAULT_OBS_COMPONENTS = ["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"]
+_BODY_OBS_COMPONENTS = ["body_pos_b", "body_ori_b", "body_lin_vel_b", "body_ang_vel_b"]
+_VALID_OBS_COMPONENTS = _DEFAULT_OBS_COMPONENTS + _BODY_OBS_COMPONENTS
+
+
 @dataclass
 class MotionData:
     """
@@ -126,6 +134,13 @@ class MotionData:
         - base_lin_velocities_local: linear velocity in local (body) frame
         - base_ang_velocities_local: (currently zeros)
         - base_quat: orientation quaternion as torch.Tensor in xyzw order
+        - body_pos_b: (optional) body positions relative to the anchor, expressed in the
+          anchor frame, i.e. R_a^T (p_b - p_a), shape (T, (N_bodies-1)*3)
+        - body_ori_b: (optional) body orientations relative to the anchor, R_a^T R_b, as 6D
+          representation [first column, second column], shape (T, (N_bodies-1)*6)
+        - body_lin_vel_b: (optional) time derivative of body_pos_b, shape (T, (N_bodies-1)*3)
+        - body_ang_vel_b: (optional) angular velocity of the body relative to the anchor,
+          expressed in the anchor frame, i.e. R_a^T (w_b - w_a), shape (T, (N_bodies-1)*3)
 
     Notes:
         - The quaternion is expected in the dataset as `xyzw` format (SciPy default),
@@ -141,6 +156,10 @@ class MotionData:
     base_ang_velocities_local: Union[torch.Tensor, np.ndarray]
     base_quat: Union[Rotation, torch.Tensor]
     device: torch.device = torch.device("cpu")
+    body_pos_b: Optional[Union[torch.Tensor, np.ndarray]] = None
+    body_ori_b: Optional[Union[torch.Tensor, np.ndarray]] = None
+    body_lin_vel_b: Optional[Union[torch.Tensor, np.ndarray]] = None
+    body_ang_vel_b: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     def __post_init__(self) -> None:
         # Convert numpy arrays (or SciPy Rotations) to torch tensors
@@ -165,6 +184,14 @@ class MotionData:
                 device=self.device,
                 dtype=torch.float32,
             )
+        if isinstance(self.body_pos_b, np.ndarray):
+            self.body_pos_b = to_tensor(self.body_pos_b)
+        if isinstance(self.body_ori_b, np.ndarray):
+            self.body_ori_b = to_tensor(self.body_ori_b)
+        if isinstance(self.body_lin_vel_b, np.ndarray):
+            self.body_lin_vel_b = to_tensor(self.body_lin_vel_b)
+        if isinstance(self.body_ang_vel_b, np.ndarray):
+            self.body_ang_vel_b = to_tensor(self.body_ang_vel_b)
 
     def __len__(self) -> int:
         return self.joint_positions.shape[0]
@@ -173,6 +200,7 @@ class MotionData:
         self,
         indices: torch.Tensor,
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
+        obs_components: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         Returns the AMP observation tensor for given indices.
@@ -181,29 +209,51 @@ class MotionData:
             indices: indices of samples to retrieve
             velocity_representation: which frame convention to use for the base
                 velocities in the observation. Defaults to BODY_FIXED_REPRESENTATION.
+            obs_components: list of observation component names to include.
+                Valid values: "joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel",
+                "body_pos_b", "body_ori_b", "body_lin_vel_b", "body_ang_vel_b".
+                If None, defaults to ["joint_pos", "joint_vel", "base_lin_vel", "base_ang_vel"].
 
         Returns:
             Concatenated observation tensor
         """
-        if velocity_representation == VelocityRepresentation.MIXED_REPRESENTATION:
-            return torch.cat(
-                (
-                    self.joint_positions[indices],
-                    self.joint_velocities[indices],
-                    self.base_lin_velocities_mixed[indices],
-                    self.base_ang_velocities_mixed[indices],
-                ),
-                dim=1,
-            )
-        return torch.cat(
-            (
-                self.joint_positions[indices],
-                self.joint_velocities[indices],
-                self.base_lin_velocities_local[indices],
-                self.base_ang_velocities_local[indices],
-            ),
-            dim=1,
+        if obs_components is None:
+            obs_components = _DEFAULT_OBS_COMPONENTS
+
+        use_mixed = (
+            velocity_representation == VelocityRepresentation.MIXED_REPRESENTATION
         )
+
+        component_map = {
+            "joint_pos": self.joint_positions,
+            "joint_vel": self.joint_velocities,
+            "base_lin_vel": (
+                self.base_lin_velocities_mixed
+                if use_mixed
+                else self.base_lin_velocities_local
+            ),
+            "base_ang_vel": (
+                self.base_ang_velocities_mixed
+                if use_mixed
+                else self.base_ang_velocities_local
+            ),
+            "body_pos_b": self.body_pos_b,
+            "body_ori_b": self.body_ori_b,
+            "body_lin_vel_b": self.body_lin_vel_b,
+            "body_ang_vel_b": self.body_ang_vel_b,
+        }
+
+        parts = []
+        for comp in obs_components:
+            tensor = component_map.get(comp)
+            if tensor is None:
+                raise ValueError(
+                    f"Observation component '{comp}' is not available in this MotionData. "
+                    f"Available components: {[k for k, v in component_map.items() if v is not None]}"
+                )
+            parts.append(tensor[indices])
+
+        return torch.cat(parts, dim=1)
 
     def get_state_for_reset(
         self,
@@ -291,13 +341,60 @@ class AMPLoader:
         velocity_representation: VelocityRepresentation = VelocityRepresentation.BODY_FIXED_REPRESENTATION,
         num_frames: int = 2,
         frame_stride: int = 1,
+        amp_obs_components: Optional[List[str]] = None,
+        body_links_names: Optional[List[str]] = None,
+        anchor_body_name: Optional[str] = None,
     ) -> None:
         self.device = device
         self.velocity_representation = velocity_representation
         self.num_frames = num_frames
         self.frame_stride = frame_stride
+        self.obs_components = amp_obs_components
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
+
+        # ─── Validate body keyframe configuration ───
+        if self.obs_components is not None:
+            self.obs_components = list(self.obs_components)
+            unknown = [c for c in self.obs_components if c not in _VALID_OBS_COMPONENTS]
+            if unknown:
+                raise ValueError(
+                    f"AMP observation component(s) {unknown} not available. "
+                    f"Valid components: {_VALID_OBS_COMPONENTS}"
+                )
+        requested_body_components = [
+            c for c in (self.obs_components or []) if c in _BODY_OBS_COMPONENTS
+        ]
+        self._needs_body_keyframes = bool(requested_body_components)
+        if self._needs_body_keyframes:
+            if body_links_names is None:
+                raise ValueError(
+                    "body_links_names must be provided when using body keyframe "
+                    f"observation components: {requested_body_components}"
+                )
+            if anchor_body_name is None:
+                raise ValueError(
+                    "anchor_body_name must be provided when using body keyframe "
+                    "observation components."
+                )
+            body_links_names = list(body_links_names)
+            if anchor_body_name not in body_links_names:
+                raise ValueError(
+                    f"anchor_body_name '{anchor_body_name}' must be present in "
+                    f"body_links_names: {body_links_names}"
+                )
+            if len(set(body_links_names)) != len(body_links_names):
+                raise ValueError(
+                    f"body_links_names contains duplicates: {body_links_names}"
+                )
+            if len(body_links_names) < 2:
+                raise ValueError(
+                    "body_links_names must contain at least one body besides the "
+                    f"anchor '{anchor_body_name}'."
+                )
+        self.body_links_names = body_links_names
+        self.anchor_body_name = anchor_body_name
+        # ─────────────────────────────────────────────
 
         # ─── Check symmetry augmentation configuration ───
         if symmetry_cfg is not None:
@@ -355,6 +452,8 @@ class AMPLoader:
                 simulation_dt,
                 dataset_slow_down,
                 expected_joint_names,
+                body_links_names=self.body_links_names,
+                anchor_body_name=self.anchor_body_name,
             )
             self.motion_data.append(md)
 
@@ -372,7 +471,9 @@ class AMPLoader:
         for data, w in zip(self.motion_data, self.dataset_weights):
             T = len(data)
             idx = torch.arange(T, device=self.device)
-            frames = data.get_amp_dataset_obs(idx, self.velocity_representation)
+            frames = data.get_amp_dataset_obs(
+                idx, self.velocity_representation, self.obs_components
+            )
             # (state, next state) pairs keep the last frame paired with itself.
             num_starts = T if span == 1 else T - span
             if num_starts < 1:
@@ -495,9 +596,21 @@ class AMPLoader:
         simulation_dt: float,
         slow_down_factor: float = 1.0,
         expected_joint_names: Union[List[str], None] = None,
+        body_links_names: Optional[List[str]] = None,
+        anchor_body_name: Optional[str] = None,
     ) -> MotionData:
         """
         Loads and processes one motion dataset.
+
+        Args:
+            dataset_path: Path to the .npy motion file.
+            simulation_dt: Target simulation timestep.
+            slow_down_factor: Factor to slow down the original data (e.g. 2.0 = twice as slow).
+            expected_joint_names: Joint ordering to use.
+            body_links_names: (Optional) List of body link names to extract from
+                the dataset. Required when using body keyframe observations.
+            anchor_body_name: (Optional) Name of the anchor body in body_links_names.
+                Required when using body keyframe observations.
 
         Returns:
             MotionData instance
@@ -564,6 +677,77 @@ class AMPLoader:
             resampled_base_orientations, simulation_dt, local=True
         )
 
+        # ─── Process body keyframes if requested ───
+        body_pos_b = None
+        body_ori_b = None
+        body_lin_vel_b = None
+        body_ang_vel_b = None
+
+        if self._needs_body_keyframes:
+            required_keys = ("body_links_list", "body_links_pos_w", "body_links_quat_w")
+            missing_keys = [k for k in required_keys if k not in data]
+            if missing_keys:
+                raise KeyError(
+                    f"Dataset '{dataset_path}' does not contain "
+                    f"{', '.join(repr(k) for k in missing_keys)}. "
+                    "Body keyframe observation components require datasets with "
+                    "'body_links_list', 'body_links_pos_w', and 'body_links_quat_w' keys."
+                )
+
+            dataset_body_names = list(data["body_links_list"])
+
+            # Build index map for body_links_names
+            body_idx_map: List[int] = []
+            for name in body_links_names:
+                if name not in dataset_body_names:
+                    raise ValueError(
+                        f"Body link '{name}' not found in dataset '{dataset_path}'. "
+                        f"Available body links: {dataset_body_names}"
+                    )
+                body_idx_map.append(dataset_body_names.index(name))
+
+            # Extract body positions and quaternions (xyzw format in dataset)
+            raw_body_pos_w = np.asarray(data["body_links_pos_w"], dtype=np.float64)[
+                :, body_idx_map, :
+            ]
+            raw_body_quat_xyzw = np.asarray(
+                data["body_links_quat_w"], dtype=np.float64
+            )[:, body_idx_map, :]
+
+            # (T_new, N_bodies, 3) positions and one SLERP-resampled Rotation per body
+            body_pos_w = self._resample_data_Rn(raw_body_pos_w, t_orig, t_new)
+            body_rot_w = [
+                self._resample_data_SO3(raw_body_quat_xyzw[:, b, :], t_orig, t_new)
+                for b in range(len(body_links_names))
+            ]
+
+            anchor_idx = body_links_names.index(anchor_body_name)
+            anchor_rot_inv = body_rot_w[anchor_idx].inv()
+            anchor_pos_w = body_pos_w[:, anchor_idx, :]
+
+            pos_b, ori_b, lin_vel_b, ang_vel_b = [], [], [], []
+            for b, rot_b in enumerate(body_rot_w):
+                if b == anchor_idx:
+                    continue
+                # R_a^T (p_b - p_a) and R_a^T R_b
+                rel_pos = anchor_rot_inv.apply(body_pos_w[:, b, :] - anchor_pos_w)
+                rel_rot = anchor_rot_inv * rot_b
+                rel_mat = rel_rot.as_matrix()
+
+                pos_b.append(rel_pos)
+                ori_b.append(np.concatenate([rel_mat[:, :, 0], rel_mat[:, :, 1]], axis=1))
+                lin_vel_b.append(self._compute_raw_derivative(rel_pos, simulation_dt))
+                # Left-trivialized derivative of R_a^T R_b equals R_a^T (w_b - w_a)
+                ang_vel_b.append(
+                    self._compute_ang_vel(rel_rot, simulation_dt, local=False)
+                )
+
+            body_pos_b = np.concatenate(pos_b, axis=1)
+            body_ori_b = np.concatenate(ori_b, axis=1)
+            body_lin_vel_b = np.concatenate(lin_vel_b, axis=1)
+            body_ang_vel_b = np.concatenate(ang_vel_b, axis=1)
+        # ─────────────────────────────────────────────────
+
         return MotionData(
             joint_positions=resampled_joint_positions,
             joint_velocities=resampled_joint_velocities,
@@ -573,6 +757,10 @@ class AMPLoader:
             base_ang_velocities_local=resampled_base_ang_vel_local,
             base_quat=resampled_base_orientations,
             device=self.device,
+            body_pos_b=body_pos_b,
+            body_ori_b=body_ori_b,
+            body_lin_vel_b=body_lin_vel_b,
+            body_ang_vel_b=body_ang_vel_b,
         )
 
     def feed_forward_generator(
